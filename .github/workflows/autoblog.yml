@@ -8,22 +8,29 @@ permissions:
 jobs:
   write:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     env:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      MAX_POSTS: "2"
+      PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Check the Google key
+        timeout-minutes: 6
         run: |
           if [ -z "$GEMINI_API_KEY" ]; then echo "::error::Secret GEMINI_API_KEY is missing or named wrong"; exit 1; fi
           python autoblog.py check
       - name: Write articles
-        run: |
-          python autoblog.py run
-          python autoblog.py approve --good
+        timeout-minutes: 12
+        run: python autoblog.py run
+      - name: Publish good articles
+        if: always()
+        run: python autoblog.py approve --good
       - name: Save to repository
+        if: always()
         run: |
           git config user.name autoblog
           git config user.email bot@users.noreply.github.com
