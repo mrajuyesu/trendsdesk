@@ -9,13 +9,13 @@ Usage:
   python autoblog.py build             # generate the website into site/
 Free AI: set GEMINI_API_KEY (Google AI Studio). Paid: pip install anthropic + ANTHROPIC_API_KEY.
 """
-import os, sys, re, json, html, datetime, urllib.request
+import os, sys, re, json, html, datetime, urllib.request, urllib.parse, urllib.error, time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 ROOT = Path(__file__).parent
 POSTS, SITE = ROOT / "posts", ROOT / "site"
-SITE_NAME = os.getenv("SITE_NAME", "Trend Desk")
+SITE_NAME = os.getenv("BLOG_NAME", "Trenddesk")   # not SITE_NAME: Netlify overwrites that one
 GEO = os.getenv("TRENDS_GEO", "IN")                 # country code for trends
 MODEL = os.getenv("MODEL", "claude-sonnet-5-5")
 MAX_POSTS = int(os.getenv("MAX_POSTS", "3"))        # drafts per run
@@ -41,15 +41,35 @@ STYLE = """You are a staff writer for a trend-explainer site. Write like a sharp
 - Health topics: general information only, from reputable bodies (WHO, CDC, NHS). No diagnoses, doses or cures; say when to see a doctor."""
 
 
+GROUNDED = {"ok": True}
+
+
 def gem(prompt, system, search):
-    body = {"contents": [{"parts": [{"text": prompt}]}]}
-    if system: body["systemInstruction"] = {"parts": [{"text": system}]}
-    if search: body["tools"] = [{"google_search": {}}]
-    req = urllib.request.Request(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')}:generateContent",
-        data=json.dumps(body).encode(), headers={"Content-Type": "application/json", "x-goog-api-key": os.environ["GEMINI_API_KEY"]})
-    r = json.load(urllib.request.urlopen(req, timeout=180))
-    return "".join(p.get("text", "") for p in r["candidates"][0]["content"]["parts"])
+    """Free Gemini API. Tries several model names (Google retires them often) and falls back if search is refused."""
+    models = [m for m in (os.getenv("GEMINI_MODEL"), "gemini-flash-latest", "gemini-3-flash-preview",
+                          "gemini-2.5-flash", "gemini-3.5-flash-lite") if m]
+    err = "no model tried"
+    for m in models:
+        for use_search in ((True, False) if search else (False,)):
+            body = {"contents": [{"parts": [{"text": prompt}]}]}
+            if system: body["systemInstruction"] = {"parts": [{"text": system}]}
+            if use_search: body["tools"] = [{"google_search": {}}]
+            req = urllib.request.Request(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
+                data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json", "x-goog-api-key": os.environ["GEMINI_API_KEY"]})
+            try:
+                r = json.load(urllib.request.urlopen(req, timeout=180))
+                text = "".join(p.get("text", "") for p in r["candidates"][0]["content"]["parts"])
+                if search: GROUNDED["ok"] = use_search
+                print(f"  (model {m}, web search {'on' if use_search else 'off'})")
+                return text
+            except urllib.error.HTTPError as e:
+                err = f"{m}: HTTP {e.code} {e.read()[:150]!r}"
+                if e.code == 429: time.sleep(15)
+            except Exception as e:
+                err = f"{m}: {e}"
+    raise RuntimeError("Gemini failed - " + err)
 
 
 def llm(prompt, system="", search=False, max_tokens=4000):
@@ -70,11 +90,26 @@ def jload(text):
 
 
 # ---------- 1. trends ----------
-def fetch_trends():
-    url = f"https://trends.google.com/trending/rss?geo={GEO}"
+def _rss(url):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     root = ET.fromstring(urllib.request.urlopen(req, timeout=20).read())
     return [i.findtext("title") for i in root.iter("item") if i.findtext("title")]
+
+
+def fetch_trends():
+    try:
+        t = _rss(f"https://trends.google.com/trending/rss?geo={GEO}")
+        if t:
+            return t
+    except Exception as e:
+        print("! Google Trends unavailable, using news headlines:", e)
+    out = []
+    for topic in ("TECHNOLOGY", "BUSINESS", "ENTERTAINMENT", "SPORTS", "HEALTH"):
+        try:
+            out += _rss(f"https://news.google.com/rss/headlines/section/topic/{topic}?hl=en-{GEO}&gl={GEO}&ceid={GEO}:en")[:6]
+        except Exception as e:
+            print("! news feed failed:", topic, e)
+    return out
 
 
 # ---------- 2. pick + categorize ----------
@@ -94,11 +129,12 @@ def write_post(item):
         '{"title":"","description":"max 155 chars","tags":["",""],"sources":[{"title":"","url":""}],"body":"markdown"}',
         system=STYLE, search=True, max_tokens=6000)
     post = jload(draft)
+    ungrounded = not GROUNDED["ok"]
     review = jload(llm(
         "Review this draft as a strict editor. Score 1-10 for accuracy (claims supported by cited sources), "
         "originality, and usefulness. Return JSON only: "
         '{"score":0,"problems":[""]}\n\n' + json.dumps(post)))
-    post["score"] = review["score"]
+    post["score"] = min(review["score"], 7) if ungrounded else review["score"]   # no web research -> stays a draft
     return post if review["score"] >= MIN_SCORE else None
 
 
@@ -120,19 +156,32 @@ def save(post, category):
     return slug
 
 
+def check():
+    """Test the AI key: python autoblog.py check"""
+    print("Writing test:", llm("Reply with the single word OK.").strip()[:40])
+    llm("Search the web: what is today's date?", search=True)
+    print("Web research:", "WORKING" if GROUNDED["ok"] else "NOT available on this key (posts will stay drafts)")
+
+
 def run():
-    seen = {p.stem for p in POSTS.rglob("*.md")}
-    done = " ".join(seen)
-    trends = [t for t in fetch_trends() if slugify(t) not in done]
-    for item in categorize(trends):
-        if item["category"] not in CATEGORIES:
+    done = " ".join(p.stem for p in POSTS.rglob("*.md"))
+    try:
+        trends = [t for t in fetch_trends() if slugify(t) not in done]
+        picks = categorize(trends)
+    except Exception as e:
+        print("! could not pick topics:", e)
+        return
+    for item in picks:
+        if item.get("category") not in CATEGORIES:
             continue
-        try:
-            post = write_post(item)
-        except Exception as e:
-            print(f"! failed: {item['topic']} ({e})")
-            continue
-        print(("saved draft: " + save(post, item["category"])) if post else f"discarded (low quality): {item['topic']}")
+        post = None
+        for attempt in (1, 2):
+            try:
+                post = write_post(item)
+                break
+            except Exception as e:
+                print(f"! attempt {attempt} failed: {item.get('topic')} ({e})")
+        print(("saved draft: " + save(post, item["category"])) if post else f"skipped: {item.get('topic')}")
 
 
 # ---------- posts io ----------
@@ -182,7 +231,7 @@ def md(text):
     return "\n".join(out)
 
 
-URL = os.getenv("SITE_URL", "https://your-site.netlify.app").rstrip("/")
+URL = (os.getenv("SITE_URL") or os.getenv("URL") or "https://your-site.netlify.app").rstrip("/")
 COLORS = {"technology": ("#2563eb", "#7c3aed", "💻"), "business": ("#059669", "#0d9488", "📈"),
           "entertainment": ("#db2777", "#f59e0b", "🎬"), "sports": ("#ea580c", "#dc2626", "🏆"),
           "lifestyle": ("#7c3aed", "#ec4899", "✨"), "health": ("#0d9488", "#22c55e", "🩺")}
@@ -220,87 +269,237 @@ footer{border-top:1px solid var(--line);margin-top:60px;padding:40px 0 24px;back
 @media(max-width:900px){.card.big{grid-template-columns:1fr}.card.big .th{min-height:180px}.sf{display:none}.sl{display:block}footer .fg{grid-template-columns:1fr 1fr}}"""
 
 
+CSS += """
+footer{border-top:1px solid var(--line);margin-top:60px;padding:40px 0 24px;color:var(--mut);font-size:14px;background:var(--card)}
+.fg{display:grid;grid-template-columns:2fr 1fr 1fr;gap:32px}footer h4{margin:0 0 10px;color:var(--fg);font-size:15px}
+footer .fg a{display:block;padding:3px 0}footer a:hover{color:var(--ac)}footer p{margin:8px 0 0;max-width:340px}
+.fb{margin-top:28px;padding-top:18px;border-top:1px solid var(--line)}
+.fm{display:grid;gap:12px;max-width:560px}.fm input,.fm textarea{width:100%;padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--fg);font:inherit}
+.fm button{justify-self:start;background:var(--ac);color:#fff;border:0;padding:12px 24px;border-radius:99px;font:inherit;cursor:pointer}
+@media(max-width:900px){.fg{grid-template-columns:1fr 1fr}}"""
+
+FAVICON = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
+           '<stop offset="0" stop-color="#2563eb"/><stop offset="1" stop-color="#7c3aed"/></linearGradient></defs>'
+           '<rect width="64" height="64" rx="14" fill="url(#g)"/><path d="M16 17h32v8H36v22h-8V25H16z" fill="#fff"/></svg>')
+
+
+def icon_png(w, h):
+    """Pure-python PNG: blue-purple gradient with a white T (no image libraries needed)."""
+    import zlib, struct
+    s = min(w, h)
+    ox, oy = (w - s) / 2, (h - s) / 2
+    rows = []
+    for y in range(h):
+        row = bytearray(b"\x00")
+        v = (y - oy) / s
+        for x in range(w):
+            u = (x - ox) / s
+            if (0.25 <= u <= 0.75 and 0.265 <= v <= 0.39) or (0.4375 <= u <= 0.5625 and 0.39 <= v <= 0.73):
+                row += b"\xff\xff\xff"
+            else:
+                t = (x / w + y / h) / 2
+                row += bytes((int(37 + 87 * t), int(99 - 41 * t), int(235 + 2 * t)))
+        rows.append(bytes(row))
+    def chunk(k, d):
+        c = struct.pack(">I", len(d)) + k + d
+        return c + struct.pack(">I", zlib.crc32(k + d) & 0xffffffff)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"".join(rows), 9)) + chunk(b"IEND", b""))
+
+
 def footer_html():
-    cats = "".join(f'<a href="/{c}/">{c.title()}</a>' for c in CATEGORIES)
-    return (f'<footer><div class="w fg"><div><div class="logo">{SITE_NAME}<b>.</b></div><p>Sourced, plain-English explainers on what the world is searching for. Researched with AI assistance and reviewed before publishing.</p></div>'
-            f'<div><h4>Categories</h4>{cats}</div><div><h4>Site</h4><a href="/about.html">About</a><a href="/search.html">Search</a>'
-            f'<a href="/rss.xml">RSS feed</a><a href="/privacy.html">Privacy</a><a href="/disclaimer.html">Disclaimer</a></div></div>'
-            f'<div class="w fb"><span>© {datetime.date.today().year} {SITE_NAME}. All rights reserved.</span><a href="#top">Back to top ↑</a></div></footer>')
+    secs = "".join(f'<a href="/{c}/">{c.title()}</a>' for c in CATEGORIES)
+    pages = [("about", "About us"), ("contact", "Contact"), ("privacy", "Privacy Policy"),
+             ("terms", "Terms &amp; Conditions"), ("disclaimer", "Disclaimer")]
+    co = "".join(f'<a href="/{u}.html">{n}</a>' for u, n in pages) + '<a href="/rss.xml">RSS feed</a>'
+    return (f'<footer><div class="w fg"><div><div class="logo">{SITE_NAME}<b>.</b></div>'
+            f'<p>Sourced, plain-English explainers on what the world is searching for. Researched with AI assistance and reviewed before publishing.</p></div>'
+            f'<div><h4>Sections</h4>{secs}</div><div><h4>Company</h4>{co}</div></div>'
+            f'<div class="w fb">© {datetime.date.today().year} {SITE_NAME}. All rights reserved. '
+            f'Health and finance articles are general information, not professional advice.</div></footer>')
 
 
 def rt(p):
     return max(1, len(p["body"].split()) // 200)
 
 
-def page(title, body, desc="", path="/", kind="website", ld=""):
+def page(title, body, desc="", path="/", kind="website", ld="", noindex=False):
     t = html.escape(title if title == SITE_NAME else f"{title} | {SITE_NAME}")
     d = html.escape(desc or f"{SITE_NAME}: clear, sourced explainers on what the world is searching for.")
     nav = "".join(f'<a href="/{c}/">{c}</a>' for c in CATEGORIES) + '<a class="sl" href="/search.html">Search</a>'
-    return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
-            f'<meta name="viewport" content="width=device-width,initial-scale=1"><title>{t}</title>'
-            f'<meta name="description" content="{d}"><link rel="canonical" href="{URL}{path}">'
-            f'<meta property="og:title" content="{t}"><meta property="og:description" content="{d}">'
-            f'<meta property="og:type" content="{kind}"><meta name="twitter:card" content="summary">'
-            f'<link rel="alternate" type="application/rss+xml" href="/rss.xml">'
-            f'<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📰</text></svg>">'
-            f'<link rel="stylesheet" href="/style.css">'
-            "<script>try{document.documentElement.dataset.theme=localStorage.theme||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light')}catch(e){}</script>"
-            f'{ld}</head><body id="top"><header><div class="w bar"><a class="logo" href="/">{SITE_NAME}<b>.</b></a><nav>{nav}</nav>'
-            f'<form class="sf" action="/search.html"><input name="q" placeholder="Search…" aria-label="Search"></form>'
-            "<button id=tg aria-label=\"Toggle dark mode\" onclick=\"var d=document.documentElement;d.dataset.theme=d.dataset.theme=='dark'?'light':'dark';try{localStorage.theme=d.dataset.theme}catch(e){}\">◐</button>"
+    robots = "noindex,follow" if noindex else "index,follow,max-image-preview:large"
+    img = f"{URL}/og-image.png"
+    head = (f'<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{t}</title>'
+            f'<meta name="description" content="{d}"><meta name="robots" content="{robots}"><meta name="theme-color" content="#2563eb">'
+            f'<link rel="canonical" href="{URL}{path}">'
+            f'<meta property="og:site_name" content="{html.escape(SITE_NAME)}"><meta property="og:title" content="{t}">'
+            f'<meta property="og:description" content="{d}"><meta property="og:type" content="{kind}">'
+            f'<meta property="og:url" content="{URL}{path}"><meta property="og:image" content="{img}">'
+            f'<meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="{t}">'
+            f'<meta name="twitter:description" content="{d}"><meta name="twitter:image" content="{img}">'
+            f'<link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png">'
+            f'<link rel="apple-touch-icon" href="/apple-touch-icon.png"><link rel="manifest" href="/site.webmanifest">'
+            f'<link rel="alternate" type="application/rss+xml" title="{html.escape(SITE_NAME)}" href="/rss.xml">'
+            f'<link rel="stylesheet" href="/style.css">')
+    theme = "<script>try{document.documentElement.dataset.theme=localStorage.theme||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light')}catch(e){}</script>"
+    toggle = ("<button id=tg aria-label=\"Toggle dark mode\" onclick=\"var d=document.documentElement;d.dataset.theme=d.dataset.theme=='dark'?'light':'dark';"
+              "try{localStorage.theme=d.dataset.theme}catch(e){}\">◐</button>")
+    return (f'<!doctype html><html lang="en"><head>{head}{theme}{ld}</head><body id="top"><header><div class="w bar">'
+            f'<a class="logo" href="/">{SITE_NAME}<b>.</b></a><nav>{nav}</nav>'
+            f'<form class="sf" action="/search.html"><input name="q" placeholder="Search…" aria-label="Search"></form>{toggle}'
             f'</div></header><main class="w">{body}</main>{footer_html()}</body></html>')
 
 
 def card(p, big=False):
     a, b, e = COLORS[p["category"]]
     u = f'/{p["category"]}/{p["slug"]}.html'
-    return (f'<article class="card{" big" if big else ""}"><a href="{u}"><div class="th" style="background:linear-gradient(135deg,{a},{b})"><span>{e}</span></div></a>'
+    cls = "card big" if big else "card"
+    return (f'<article class="{cls}"><a href="{u}"><div class="th" style="background:linear-gradient(135deg,{a},{b})"><span>{e}</span></div></a>'
             f'<div class="cb"><a class="tag" href="/{p["category"]}/">{p["category"]}</a><h3><a href="{u}">{html.escape(p["title"])}</a></h3>'
             f'<p>{html.escape(p["description"])}</p><div class="meta">{p["date"]} · {rt(p)} min read</div></div></article>')
 
 
 def grid(ps):
-    return f'<div class="grid">{"".join(card(p) for p in ps)}</div>' if ps else '<p class="meta">Fresh articles are on the way.</p>'
+    if not ps:
+        return '<p class="meta">Fresh articles are on the way.</p>'
+    return '<div class="grid">' + "".join(card(p) for p in ps) + "</div>"
 
 
-def write(path, text):
+def write(path, content):
     f = SITE / path
     f.parent.mkdir(parents=True, exist_ok=True)
-    f.write_text(text, encoding="utf-8")
+    if isinstance(content, bytes):
+        f.write_bytes(content)
+        return
+    base = urllib.parse.urlparse(URL).path.rstrip("/")
+    if base and str(path).endswith(".html"):
+        content = re.sub(r'(href|src|action)="/(?!/)', rf'\1="{base}/', content).replace("fetch('/search.json')", f"fetch('{base}/search.json')")
+    f.write_text(content, encoding="utf-8")
+
+
+def info_page(slug, title, desc, inner):
+    today = datetime.date.today().strftime("%B %d, %Y")
+    body = f'<article class="post"><h1>{title}</h1><p class="meta">Last updated: {today}</p>{inner}</article>'
+    write(f"{slug}.html", page(title, body, desc, f"/{slug}.html"))
+
+
+def build_pages():
+    n = html.escape(SITE_NAME)
+    info_page("about", f"About {n}", f"About {SITE_NAME}: who we are, how we research and write, and how we handle corrections.", f"""
+<p>{n} explains what people are searching for right now, in plain English. We cover technology, health, business, entertainment, sports and lifestyle, and our goal is simple: give you a clear, useful answer in a few minutes, with sources you can check.</p>
+<h2>How we make articles</h2>
+<p>Every article starts from a real trending topic. We read several public sources, write a clear explainer, and run a second review that checks claims against the sources. Articles that do not meet our quality bar are discarded, not published.</p>
+<h2>Our use of AI</h2>
+<p>We use AI tools to help research and draft articles, and we say so openly. AI assistance does not replace editorial standards: we do not invent quotes or statistics, and we list sources on articles wherever we use them.</p>
+<h2>Health and money topics</h2>
+<p>Health and finance articles are general education only. They are not medical or investment advice. Please read our <a href="/disclaimer.html">Disclaimer</a>.</p>
+<h2>Corrections</h2>
+<p>If you spot a mistake, <a href="/contact.html">tell us</a> and we will review it and correct it quickly.</p>""")
+    info_page("privacy", "Privacy Policy", f"How {SITE_NAME} handles your information, cookies and third-party services.", f"""
+<p>Your privacy matters. This policy explains what information {n} collects and how it is used.</p>
+<h2>Information we collect</h2>
+<p>You do not need an account to read {n}. If you send a message through our <a href="/contact.html">contact form</a>, we receive the name, email address and message you type, and we use them only to reply to you.</p>
+<h2>Log data</h2>
+<p>Like most websites, our hosting provider may automatically record technical data such as IP address, browser type and pages visited, for security and performance.</p>
+<h2>Cookies and local storage</h2>
+<p>We store one preference in your browser (light or dark mode). It never leaves your device. If we add analytics or advertising in future, we will update this policy first. Where ads are shown, third-party vendors, including Google, may use cookies to serve ads based on your visits to this and other sites. You can opt out of personalised advertising in your Google Ads Settings.</p>
+<h2>External links</h2>
+<p>Our articles link to other websites. We are not responsible for their content or privacy practices.</p>
+<h2>Children</h2>
+<p>{n} is not directed to children under 13, and we do not knowingly collect their personal information.</p>
+<h2>Your choices</h2>
+<p>You can ask us to delete any message you sent us by writing through the <a href="/contact.html">contact page</a>.</p>
+<h2>Changes</h2>
+<p>We may update this policy and will change the date above when we do.</p>""")
+    info_page("terms", "Terms &amp; Conditions", f"The terms for using {SITE_NAME}.", f"""
+<p>By using {n} you agree to these terms. If you do not agree, please do not use the site.</p>
+<h2>Information only</h2>
+<p>Our content is provided for general information and education. It is not professional medical, legal, financial or investment advice. See our <a href="/disclaimer.html">Disclaimer</a>.</p>
+<h2>Accuracy</h2>
+<p>Articles are researched and drafted with AI assistance and reviewed before publishing. We work hard to be accurate, but we cannot guarantee that everything is complete, current or error-free. Please check important facts with official sources.</p>
+<h2>Intellectual property</h2>
+<p>The articles, design and branding of {n} belong to us. You may share links and short excerpts with clear credit and a link back. You may not copy whole articles or republish them without permission.</p>
+<h2>Acceptable use</h2>
+<p>Do not misuse the site: no unlawful activity, no attempts to disrupt or hack it, and no automated scraping that harms performance.</p>
+<h2>Third-party links</h2>
+<p>Links to other sites are provided for convenience. We do not control or endorse their content.</p>
+<h2>No warranty and limitation of liability</h2>
+<p>The site is provided "as is" without warranties of any kind. To the fullest extent allowed by law, {n} is not liable for any loss arising from your use of the site or reliance on its content.</p>
+<h2>Changes and governing law</h2>
+<p>We may update these terms from time to time. These terms are governed by the laws of India.</p>
+<h2>Contact</h2>
+<p>Questions? Visit our <a href="/contact.html">contact page</a>.</p>""")
+    info_page("disclaimer", "Disclaimer", f"{SITE_NAME} provides general information only. Read our health, finance and accuracy disclaimer.", f"""
+<h2>Not professional advice</h2>
+<p>Everything on {n} is general information. Health articles are not medical advice and do not replace a doctor. Business and money articles are not financial or investment advice. Always consult a qualified professional about your own situation.</p>
+<h2>AI-assisted content</h2>
+<p>Articles are drafted with AI assistance and checked before publishing. Mistakes can still happen. If you notice one, please <a href="/contact.html">tell us</a>.</p>
+<h2>External sources</h2>
+<p>We link to third-party sources and are not responsible for their content.</p>""")
+    form = ('<form class="fm" name="contact" method="POST" action="/thanks.html" data-netlify="true" netlify-honeypot="bot-field">'
+            '<input type="hidden" name="form-name" value="contact"><p hidden><label>Leave empty: <input name="bot-field"></label></p>'
+            '<input name="name" placeholder="Your name" required><input type="email" name="email" placeholder="Your email" required>'
+            '<textarea name="message" rows="6" placeholder="How can we help? Corrections, questions, feedback..." required></textarea>'
+            '<button type="submit">Send message</button></form>')
+    info_page("contact", "Contact us", f"Contact {SITE_NAME} for corrections, questions or feedback.",
+              f"<p>Found an error, have a question or want to give feedback? Send us a message and we will reply as soon as we can.</p>{form}")
+    write("thanks.html", page("Thank you", '<section class="hero"><h1>Thank you!</h1><p>Your message was sent. We will get back to you soon. <a href="/">Back to home</a></p></section>', path="/thanks.html", noindex=True))
 
 
 def build():
     live = [p for p in all_posts() if p["status"] == "published"]
     write("style.css", CSS)
-    hero = f'<section class="hero"><h1>What the world is searching for, explained.</h1><p>Sourced, plain-English explainers on today\'s trending topics.</p></section>'
+    write("favicon.svg", FAVICON)
+    for name, (w, h) in {"favicon-32.png": (32, 32), "apple-touch-icon.png": (180, 180), "icon-192.png": (192, 192),
+                         "icon-512.png": (512, 512), "og-image.png": (1200, 630)}.items():
+        write(name, icon_png(w, h))
+    write("site.webmanifest", json.dumps({"name": SITE_NAME, "short_name": SITE_NAME, "start_url": "/", "display": "standalone",
+          "background_color": "#ffffff", "theme_color": "#2563eb",
+          "icons": [{"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"}, {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"}]}))
+    write("_headers", "/*\n  X-Content-Type-Options: nosniff\n  X-Frame-Options: SAMEORIGIN\n  Referrer-Policy: strict-origin-when-cross-origin\n/*.png\n  Cache-Control: public, max-age=604800\n")
+    # home
+    hero = ('<section class="hero"><h1>What the world is searching for, explained.</h1>'
+            '<p>Sourced, plain-English explainers on today\'s trending topics.</p></section>')
     home = hero + (card(live[0], True) if live else "") + f'<div class="sec"><h2>Latest</h2></div>{grid(live[1:7])}'
     for c in CATEGORIES:
-        ps = ([p for p in live if p["category"] == c and p not in live[:7]] or [p for p in live if p["category"] == c])[:3]
+        ps = [p for p in live if p["category"] == c][:3]
         if ps:
             home += f'<div class="sec"><h2>{c}</h2><a href="/{c}/">View all →</a></div>{grid(ps)}'
-    write("index.html", page(SITE_NAME, home))
+    site_ld = json.dumps({"@context": "https://schema.org", "@graph": [
+        {"@type": "Organization", "name": SITE_NAME, "url": URL, "logo": f"{URL}/icon-512.png"},
+        {"@type": "WebSite", "name": SITE_NAME, "url": URL, "potentialAction": {"@type": "SearchAction",
+         "target": f"{URL}/search.html?q={{search_term_string}}", "query-input": "required name=search_term_string"}}]})
+    write("index.html", page(SITE_NAME, home, ld=f'<script type="application/ld+json">{site_ld}</script>'))
     for c in CATEGORIES:
         ps = [p for p in live if p["category"] == c]
         write(f"{c}/index.html", page(c.title(), f'<section class="hero"><h1>{c.title()}</h1><p>{CATEGORIES[c]}</p></section>{grid(ps)}',
-                                      CATEGORIES[c], f"/{c}/"))
+                                      f"{c.title()} articles: {CATEGORIES[c]}", f"/{c}/"))
+    # articles
     for p in live:
         rel = [r for r in live if r["category"] == p["category"] and r is not p][:3]
         src = "".join(f'<li><a href="{s["url"]}" rel="noopener nofollow">{html.escape(s["title"])}</a></li>' for s in p["sources"])
         u = f'/{p["category"]}/{p["slug"]}.html'
-        ld = ('<script type="application/ld+json">' + json.dumps({"@context": "https://schema.org", "@type": "Article",
-              "headline": p["title"], "description": p["description"], "datePublished": p["date"],
-              "mainEntityOfPage": URL + u, "publisher": {"@type": "Organization", "name": SITE_NAME}}) + "</script>")
-        share = (f'<div class="share"><a href="https://wa.me/?text={URL+u}">WhatsApp</a>'
-                 f'<a href="https://twitter.com/intent/tweet?url={URL+u}">Post on X</a>'
-                 f'<button onclick="navigator.clipboard.writeText(location.href);this.textContent=\'Copied!\'">Copy link</button></div>')
+        art = {"@context": "https://schema.org", "@type": "Article", "headline": p["title"], "description": p["description"],
+               "datePublished": p["date"], "dateModified": p["date"], "image": [f"{URL}/og-image.png"],
+               "author": {"@type": "Organization", "name": SITE_NAME}, "mainEntityOfPage": URL + u,
+               "publisher": {"@type": "Organization", "name": SITE_NAME, "logo": {"@type": "ImageObject", "url": f"{URL}/icon-512.png"}}}
+        crumbs = {"@context": "https://schema.org", "@type": "BreadcrumbList", "itemListElement": [
+            {"@type": "ListItem", "position": 1, "name": "Home", "item": URL + "/"},
+            {"@type": "ListItem", "position": 2, "name": p["category"].title(), "item": f'{URL}/{p["category"]}/'},
+            {"@type": "ListItem", "position": 3, "name": p["title"], "item": URL + u}]}
+        ld = "".join(f'<script type="application/ld+json">{json.dumps(x)}</script>' for x in (art, crumbs))
+        share = (f'<div class="share"><a href="https://wa.me/?text={URL + u}">WhatsApp</a>'
+                 f'<a href="https://twitter.com/intent/tweet?url={URL + u}">Post on X</a>'
+                 "<button onclick=\"navigator.clipboard.writeText(location.href);this.textContent='Copied!'\">Copy link</button></div>")
+        note = "This article was researched and drafted with AI assistance and reviewed before publishing. Spot an error? <a href=\"/contact.html\">Tell us</a>."
+        if p["category"] == "health":
+            note += " This is general information, not medical advice; talk to a doctor about your own health."
         body = (f'<article class="post"><div class="crumb"><a href="/">Home</a> / <a href="/{p["category"]}/">{p["category"].title()}</a></div>'
                 f'<h1>{html.escape(p["title"])}</h1><div class="meta">{p["date"]} · {rt(p)} min read</div>{share}{md(p["body"])}'
-                + (f'<h2>Sources</h2><ul>{src}</ul>' if src else "")
-                + ('<div class="note"><b>Health information only.</b> This is general information, not medical advice. Speak to a doctor or qualified professional about your own situation.</div>' if p["category"] == "health" else "")
-                + '<div class="note">This article was researched and drafted with AI assistance and reviewed before publishing. '
-                  'Spot an error? Tell us and we will fix it.</div></article>'
+                + (f"<h2>Sources</h2><ul>{src}</ul>" if src else "") + f'<div class="note">{note}</div></article>'
                 + (f'<div class="sec"><h2>Related</h2></div>{grid(rel)}' if rel else ""))
         write(u.lstrip("/"), page(p["title"], body, p["description"], u, "article", ld))
+    # search, pages, feeds
     idx = [{"t": html.escape(p["title"]), "d": html.escape(p["description"]), "g": " ".join(p["tags"]), "c": p["category"],
             "dt": p["date"], "u": f'/{p["category"]}/{p["slug"]}.html'} for p in live]
     write("search.json", json.dumps(idx))
@@ -308,19 +507,21 @@ def build():
           "function go(){const t=q.value.toLowerCase().trim();r.innerHTML=d.filter(p=>!t||(p.t+' '+p.d+' '+p.g).toLowerCase().includes(t))"
           ".map(p=>`<div class=card2><a href=\"${p.u}\"><b>${p.t}</b></a><div class=meta>${p.c} · ${p.dt}</div><p>${p.d}</p></div>`).join('')||'<p>No results.</p>'}"
           "q.value=new URLSearchParams(location.search).get('q')||'';q.oninput=go;go()})</script>")
-    write("search.html", page("Search", f'<section class="hero"><h1>Search</h1></section><input id=q placeholder="Search articles…" autofocus><div id=r></div>{js}', path="/search.html"))
-    write("about.html", page("About", f'<article class="post"><h1>About {SITE_NAME}</h1><p>{SITE_NAME} explains what people are searching for right now across technology, health, business, entertainment, sports and lifestyle.</p><h2>How we work</h2><p>Every article is researched from public sources, drafted with AI assistance, checked by a second review pass, and approved before publishing. Sources are listed on each article.</p><h2>Corrections</h2><p>If you find a mistake, please contact us and we will correct it promptly.</p></article>', path="/about.html"))
-    write("privacy.html", page("Privacy Policy", f'<article class="post"><h1>Privacy Policy</h1><p>{SITE_NAME} does not require accounts and does not collect personal data directly. Your theme preference is stored only in your own browser. If advertising or analytics are added later, this page will be updated to describe them.</p></article>', path="/privacy.html"))
-    write("disclaimer.html", page("Disclaimer", f'<article class="post"><h1>Disclaimer</h1><p>{SITE_NAME} publishes general information for education. It is not medical, legal, financial or other professional advice, and it does not replace a qualified professional.</p><p>Articles are drafted with AI assistance and reviewed, but errors can happen. Please check important facts with official sources and tell us about mistakes so we can correct them.</p><p>Health articles are for general awareness only. If you feel unwell or are worried about your health, contact a doctor or local emergency services.</p></article>', path="/disclaimer.html"))
-    write("404.html", page("Page not found", '<section class="hero"><h1>Page not found</h1><p><a href="/">Back to the home page</a></p></section>'))
+    write("search.html", page("Search", f'<section class="hero"><h1>Search</h1></section><input id=q placeholder="Search articles…" autofocus><div id=r></div>{js}',
+                              path="/search.html", noindex=True))
+    build_pages()
+    write("404.html", page("Page not found", '<section class="hero"><h1>Page not found</h1><p><a href="/">Back to the home page</a></p></section>', noindex=True))
     write("robots.txt", f"User-agent: *\nAllow: /\nSitemap: {URL}/sitemap.xml\n")
-    urls = ["/", "/about.html", "/disclaimer.html", "/privacy.html"] + [f"/{c}/" for c in CATEGORIES] + [f'/{p["category"]}/{p["slug"]}.html' for p in live]
+    today = datetime.date.today().isoformat()
+    urls = [("/", today)] + [(f"/{x}.html", today) for x in ("about", "contact", "privacy", "terms", "disclaimer")] \
+        + [(f"/{c}/", today) for c in CATEGORIES] + [(f'/{p["category"]}/{p["slug"]}.html', p["date"]) for p in live]
     write("sitemap.xml", '<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
-          + "".join(f"<url><loc>{URL}{u}</loc></url>" for u in urls) + "</urlset>")
+          + "".join(f"<url><loc>{URL}{u}</loc><lastmod>{d}</lastmod></url>" for u, d in urls) + "</urlset>")
     items = "".join(f'<item><title>{html.escape(p["title"])}</title><link>{URL}/{p["category"]}/{p["slug"]}.html</link>'
                     f'<description>{html.escape(p["description"])}</description></item>' for p in live[:20])
-    write("rss.xml", f'<?xml version="1.0"?><rss version="2.0"><channel><title>{SITE_NAME}</title><link>{URL}</link><description>Latest articles</description>{items}</channel></rss>')
-    print(f"built {len(live)} posts -> {SITE}/  (preview: cd site && python -m http.server)")
+    write("rss.xml", f'<?xml version="1.0"?><rss version="2.0"><channel><title>{html.escape(SITE_NAME)}</title><link>{URL}</link>'
+                     f'<description>Latest articles</description>{items}</channel></rss>')
+    print(f"built {len(live)} posts -> {SITE}/")
 
 
 if __name__ == "__main__":
@@ -328,6 +529,7 @@ if __name__ == "__main__":
     if cmd == "run": run()
     elif cmd == "list": [print(f'{p["status"]:9} {p["category"]:14} {p["score"]}/10  {p["slug"]}') for p in all_posts()]
     elif cmd == "approve" and len(sys.argv) > 2: approve(sys.argv[2])
+    elif cmd == "check": check()
     elif cmd == "build": build()
     elif cmd == "auto": run(); approve("--good"); build()   # for scheduled/Netlify builds
     else: print(__doc__)
