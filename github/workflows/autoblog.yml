@@ -1,0 +1,31 @@
+name: Write new articles
+on:
+  schedule:
+    - cron: "0 */8 * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  write:
+    runs-on: ubuntu-latest
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check the Google key
+        run: |
+          if [ -z "$GEMINI_API_KEY" ]; then echo "::error::Secret GEMINI_API_KEY is missing or named wrong"; exit 1; fi
+          python autoblog.py check
+      - name: Write articles
+        run: |
+          python autoblog.py run
+          python autoblog.py approve --good
+      - name: Save to repository
+        run: |
+          git config user.name autoblog
+          git config user.email bot@users.noreply.github.com
+          git add posts
+          git diff --cached --quiet || (git commit -m "New articles" && git push)
