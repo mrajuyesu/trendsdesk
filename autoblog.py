@@ -41,47 +41,44 @@ STYLE = """You are a staff writer for a trend-explainer site. Write like a sharp
 - Health topics: general information only, from reputable bodies (WHO, CDC, NHS). No diagnoses, doses or cures; say when to see a doctor."""
 
 
-GROUNDED = {"ok": True}
+WORKING = {"model": None}
 
 
-def gem(prompt, system, search):
-    """Free Gemini API. Tries several model names (Google retires them often) and falls back if search is refused."""
-    models = [m for m in (os.getenv("GEMINI_MODEL"), "gemini-flash-latest", "gemini-3-flash-preview",
+def gem(prompt, system=""):
+    """Free Gemini API. Tries several model names (Google retires them often) and remembers the one that works."""
+    key = os.environ["GEMINI_API_KEY"].strip()
+    models = [m for m in (WORKING["model"], os.getenv("GEMINI_MODEL"), "gemini-flash-latest", "gemini-3-flash-preview",
                           "gemini-2.5-flash", "gemini-3.5-flash-lite") if m]
     err = "no model tried"
-    for m in models:
-        for use_search in ((True, False) if search else (False,)):
-            body = {"contents": [{"parts": [{"text": prompt}]}]}
-            if system: body["systemInstruction"] = {"parts": [{"text": system}]}
-            if use_search: body["tools"] = [{"google_search": {}}]
-            req = urllib.request.Request(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
-                data=json.dumps(body).encode(),
-                headers={"Content-Type": "application/json", "x-goog-api-key": os.environ["GEMINI_API_KEY"]})
-            try:
-                r = json.load(urllib.request.urlopen(req, timeout=180))
-                text = "".join(p.get("text", "") for p in r["candidates"][0]["content"]["parts"])
-                if search: GROUNDED["ok"] = use_search
-                print(f"  (model {m}, web search {'on' if use_search else 'off'})")
-                return text
-            except urllib.error.HTTPError as e:
-                err = f"{m}: HTTP {e.code} {e.read()[:150]!r}"
-                if e.code == 429: time.sleep(15)
-            except Exception as e:
-                err = f"{m}: {e}"
+    for m in dict.fromkeys(models):
+        body = {"contents": [{"parts": [{"text": prompt}]}]}
+        if system:
+            body["systemInstruction"] = {"parts": [{"text": system}]}
+        req = urllib.request.Request(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
+            data=json.dumps(body).encode(), headers={"Content-Type": "application/json", "x-goog-api-key": key})
+        try:
+            r = json.load(urllib.request.urlopen(req, timeout=90))
+            WORKING["model"] = m
+            print(f"  (model {m})", flush=True)
+            return "".join(p.get("text", "") for p in r["candidates"][0]["content"]["parts"])
+        except urllib.error.HTTPError as e:
+            err = f"{m}: HTTP {e.code} {e.read()[:150]!r}"
+            print("  !", err, flush=True)
+            if e.code == 429:
+                time.sleep(10)
+        except Exception as e:
+            err = f"{m}: {e}"
+            print("  !", err, flush=True)
     raise RuntimeError("Gemini failed - " + err)
 
 
-def llm(prompt, system="", search=False, max_tokens=4000):
+def llm(prompt, system="", max_tokens=4000):
     if os.getenv("GEMINI_API_KEY"):          # free option
-        return gem(prompt, system, search)
-    import anthropic
-    kw = {}
-    if search:
-        kw["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}]
-    r = anthropic.Anthropic().messages.create(
-        model=MODEL, max_tokens=max_tokens, system=system,
-        messages=[{"role": "user", "content": prompt}], **kw)
+        return gem(prompt, system)
+    import anthropic                          # paid option
+    r = anthropic.Anthropic().messages.create(model=MODEL, max_tokens=max_tokens, system=system,
+                                              messages=[{"role": "user", "content": prompt}])
     return "".join(b.text for b in r.content if b.type == "text")
 
 
@@ -89,52 +86,92 @@ def jload(text):
     return json.loads(re.search(r"\{.*\}|\[.*\]", text, re.S).group(0))
 
 
-# ---------- 1. trends ----------
-def _rss(url):
+# ---------- 1. trends + their real news sources (no paid search needed) ----------
+def get(url, timeout=20):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    root = ET.fromstring(urllib.request.urlopen(req, timeout=20).read())
-    return [i.findtext("title") for i in root.iter("item") if i.findtext("title")]
+    return urllib.request.urlopen(req, timeout=timeout).read()
+
+
+def strip_html(s):
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", s or ""))).strip()
+
+
+def _txt(node, name):
+    for c in node.iter():
+        if c.tag.split("}")[-1] == name and c.text:
+            return strip_html(c.text)
+    return ""
 
 
 def fetch_trends():
-    try:
-        t = _rss(f"https://trends.google.com/trending/rss?geo={GEO}")
-        if t:
-            return t
-    except Exception as e:
-        print("! Google Trends unavailable, using news headlines:", e)
+    """-> [{"title": str, "sources": [{"title","url","snippet"}]}]"""
     out = []
-    for topic in ("TECHNOLOGY", "BUSINESS", "ENTERTAINMENT", "SPORTS", "HEALTH"):
-        try:
-            out += _rss(f"https://news.google.com/rss/headlines/section/topic/{topic}?hl=en-{GEO}&gl={GEO}&ceid={GEO}:en")[:6]
-        except Exception as e:
-            print("! news feed failed:", topic, e)
+    try:
+        root = ET.fromstring(get(f"https://trends.google.com/trending/rss?geo={GEO}"))
+        for it in root.iter("item"):
+            srcs = [{"title": _txt(n, "news_item_title"), "url": _txt(n, "news_item_url"), "snippet": _txt(n, "news_item_snippet")}
+                    for n in it if n.tag.split("}")[-1] == "news_item"]
+            if it.findtext("title"):
+                out.append({"title": it.findtext("title"), "sources": [s for s in srcs if s["url"]]})
+    except Exception as e:
+        print("! Google Trends unavailable:", e, flush=True)
+    if not out:                                   # fallback: Google News headlines
+        for topic in ("TECHNOLOGY", "BUSINESS", "ENTERTAINMENT", "SPORTS", "HEALTH"):
+            try:
+                root = ET.fromstring(get(f"https://news.google.com/rss/headlines/section/topic/{topic}?hl=en-{GEO}&gl={GEO}&ceid={GEO}:en"))
+                for it in list(root.iter("item"))[:6]:
+                    t = strip_html(it.findtext("title"))
+                    out.append({"title": t, "sources": [{"title": t, "url": it.findtext("link") or "", "snippet": strip_html(it.findtext("description"))}]})
+            except Exception as e:
+                print("! news feed failed:", topic, e, flush=True)
     return out
+
+
+def page_text(url):
+    try:
+        raw = get(url, 12)[:300000].decode("utf-8", "ignore")
+        raw = re.sub(r"(?is)<(script|style|nav|footer|header)[^>]*>.*?</\1>", " ", raw)
+        return strip_html(raw)[:2500]
+    except Exception:
+        return ""
 
 
 # ---------- 2. pick + categorize ----------
 def categorize(trends):
-    prompt = (f"Categories: {json.dumps(CATEGORIES)}\nAvoid: {AVOID}\n"
-              f"Trending searches: {json.dumps(trends)}\n"
+    cand = [t for t in trends if len(t["sources"]) >= 2] or [t for t in trends if t["sources"]]
+    if not cand:
+        return []
+    listing = "\n".join(f'{i}: {t["title"]}' for i, t in enumerate(cand))
+    prompt = (f"Categories: {json.dumps(CATEGORIES)}\nAvoid: {AVOID}\nTrending searches (id: topic):\n{listing}\n"
               f"Pick up to {MAX_POSTS} that fit a category and can support a useful, factual explainer. "
-              'Return JSON list: [{"topic":"","category":"","angle":"one-line original angle"}]. JSON only.')
-    return jload(llm(prompt))[:MAX_POSTS]
+              'Return a JSON list: [{"id":0,"category":"","angle":"one-line original angle"}]. JSON only.')
+    return [(cand[int(x["id"])], x) for x in jload(llm(prompt))[:MAX_POSTS] if 0 <= int(x["id"]) < len(cand)]
 
 
-# ---------- 3-5. research, write, quality gate ----------
-def write_post(item):
-    draft = llm(
-        f"Topic: {item['topic']}\nCategory: {item['category']}\nAngle: {item['angle']}\n"
-        "Search the web, read several credible sources, then write the article. Return JSON only: "
-        '{"title":"","description":"max 155 chars","tags":["",""],"sources":[{"title":"","url":""}],"body":"markdown"}',
-        system=STYLE, search=True, max_tokens=6000)
+# ---------- 3-5. research (real sources), write, quality gate ----------
+def write_post(trend, pick):
+    srcs = trend["sources"][:4]
+    pack = []
+    for s in srcs:
+        s["text"] = page_text(s["url"])
+        pack.append(f'SOURCE: {s["title"]}\nURL: {s["url"]}\nSNIPPET: {s["snippet"]}\nPAGE TEXT: {s["text"]}')
+    material = "\n\n".join(pack)
+    if not any(s["snippet"] or s["text"] for s in srcs):
+        return None                              # never write without real source material
+    grounded = sum(1 for s in srcs if s["snippet"] or s["text"]) >= 2
+    draft = llm("Topic: " + trend["title"] + "\nCategory: " + pick["category"] + "\nAngle: " + str(pick.get("angle", "")) +
+                "\nWrite the article using ONLY the source material below. Do not add facts that the sources do not support. "
+                'If the material is too thin for a useful article, return {"skip": true}. Otherwise return JSON only: '
+                '{"title":"","description":"max 155 chars","tags":["",""],"body":"markdown"}\n\n' + material,
+                system=STYLE, max_tokens=6000)
     post = jload(draft)
-    ungrounded = not GROUNDED["ok"]
-    review = jload(llm(
-        "Review this draft as a strict editor. Score 1-10 for accuracy (claims supported by cited sources), "
-        "originality, and usefulness. Return JSON only: "
-        '{"score":0,"problems":[""]}\n\n' + json.dumps(post)))
-    post["score"] = min(review["score"], 7) if ungrounded else review["score"]   # no web research -> stays a draft
+    if post.get("skip"):
+        return None
+    post["sources"] = [{"title": s["title"] or s["url"], "url": s["url"]} for s in srcs]
+    review = jload(llm("Review this draft as a strict editor against the sources. Score 1-10 for accuracy (every claim supported), "
+                       'originality and usefulness. Return JSON only: {"score":0,"problems":[""]}\n\nSOURCES:\n' + material +
+                       "\n\nDRAFT:\n" + post["body"]))
+    post["score"] = review["score"] if grounded else min(review["score"], 7)   # thin sources -> stays a draft
     return post if review["score"] >= MIN_SCORE else None
 
 
@@ -143,45 +180,48 @@ def slugify(s):
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:60]
 
 
-def save(post, category):
+def save(post, category, trend_title=""):
     d = POSTS / category
     d.mkdir(parents=True, exist_ok=True)
     date = datetime.date.today().isoformat()
     slug = f"{date}-{slugify(post['title'])}"
+    if (d / f"{slug}.md").exists():
+        return slug + " (already exists, kept)"
     meta = {"title": post["title"], "description": post["description"], "category": category,
             "date": date, "tags": post["tags"], "sources": post["sources"],
-            "score": post["score"], "status": "draft"}
+            "score": post["score"], "trend": trend_title, "status": "draft"}
     text = "".join(f"{k}: {json.dumps(v, ensure_ascii=False)}\n" for k, v in meta.items())
     (d / f"{slug}.md").write_text(f"---\n{text}---\n{post['body']}\n", encoding="utf-8")
     return slug
 
 
 def check():
-    """Test the AI key: python autoblog.py check"""
-    print("Writing test:", llm("Reply with the single word OK.").strip()[:40])
-    llm("Search the web: what is today's date?", search=True)
-    print("Web research:", "WORKING" if GROUNDED["ok"] else "NOT available on this key (posts will stay drafts)")
+    """Test everything: python autoblog.py check"""
+    print("Writing test:", llm("Reply with the single word OK.").strip()[:40], flush=True)
+    t = fetch_trends()
+    print(f"Trends found: {len(t)} (with 2+ news sources: {sum(1 for x in t if len(x['sources']) >= 2)})", flush=True)
 
 
 def run():
-    done = " ".join(p.stem for p in POSTS.rglob("*.md"))
+    seen = {p.get("trend") for p in all_posts()}
     try:
-        trends = [t for t in fetch_trends() if slugify(t) not in done]
+        trends = [t for t in fetch_trends() if t["title"] not in seen]
         picks = categorize(trends)
     except Exception as e:
-        print("! could not pick topics:", e)
+        print("! could not pick topics:", e, flush=True)
         return
-    for item in picks:
-        if item.get("category") not in CATEGORIES:
+    for trend, pick in picks:
+        if pick.get("category") not in CATEGORIES:
             continue
+        print("writing:", trend["title"], flush=True)
         post = None
         for attempt in (1, 2):
             try:
-                post = write_post(item)
+                post = write_post(trend, pick)
                 break
             except Exception as e:
-                print(f"! attempt {attempt} failed: {item.get('topic')} ({e})")
-        print(("saved draft: " + save(post, item["category"])) if post else f"skipped: {item.get('topic')}")
+                print(f"! attempt {attempt} failed: {e}", flush=True)
+        print(("saved draft: " + save(post, pick["category"], trend["title"])) if post else f"skipped: {trend['title']}", flush=True)
 
 
 # ---------- posts io ----------
@@ -278,6 +318,8 @@ footer .fg a{display:block;padding:3px 0}footer a:hover{color:var(--ac)}footer p
 .fm button{justify-self:start;background:var(--ac);color:#fff;border:0;padding:12px 24px;border-radius:99px;font:inherit;cursor:pointer}
 @media(max-width:900px){.fg{grid-template-columns:1fr 1fr}}"""
 
+CSS += ".cv{width:100%;height:170px;object-fit:cover;display:block}.card.big .cv{height:100%;min-height:260px}.hero-img{width:100%;border-radius:16px;margin:18px 0;display:block}"
+
 FAVICON = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
            '<stop offset="0" stop-color="#2563eb"/><stop offset="1" stop-color="#7c3aed"/></linearGradient></defs>'
            '<rect width="64" height="64" rx="14" fill="url(#g)"/><path d="M16 17h32v8H36v22h-8V25H16z" fill="#fff"/></svg>')
@@ -350,11 +392,21 @@ def page(title, body, desc="", path="/", kind="website", ld="", noindex=False):
             f'</div></header><main class="w">{body}</main>{footer_html()}</body></html>')
 
 
-def card(p, big=False):
+def cover_svg(p):
+    import random
+    r = random.Random(p["slug"])
     a, b, e = COLORS[p["category"]]
+    shapes = "".join(f'<circle cx="{r.randint(0, 1200)}" cy="{r.randint(0, 630)}" r="{r.randint(60, 260)}" fill="#fff" opacity="{r.choice([.07, .11, .15])}"/>' for _ in range(7))
+    x2, y2 = r.choice([(1, 1), (1, 0), (0, 1)])
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630"><defs><linearGradient id="g" x1="0" y1="0" x2="{x2}" y2="{y2}">'
+            f'<stop offset="0" stop-color="{a}"/><stop offset="1" stop-color="{b}"/></linearGradient></defs>'
+            f'<rect width="1200" height="630" fill="url(#g)"/>{shapes}<text x="600" y="400" font-size="220" text-anchor="middle">{e}</text></svg>')
+
+
+def card(p, big=False):
     u = f'/{p["category"]}/{p["slug"]}.html'
     cls = "card big" if big else "card"
-    return (f'<article class="{cls}"><a href="{u}"><div class="th" style="background:linear-gradient(135deg,{a},{b})"><span>{e}</span></div></a>'
+    return (f'<article class="{cls}"><a href="{u}"><img class="cv" src="/covers/{p["slug"]}.svg" alt="{html.escape(p["title"])}" loading="lazy"></a>'
             f'<div class="cb"><a class="tag" href="/{p["category"]}/">{p["category"]}</a><h3><a href="{u}">{html.escape(p["title"])}</a></h3>'
             f'<p>{html.escape(p["description"])}</p><div class="meta">{p["date"]} · {rt(p)} min read</div></div></article>')
 
@@ -449,6 +501,8 @@ def build_pages():
 def build():
     live = [p for p in all_posts() if p["status"] == "published"]
     write("style.css", CSS)
+    for p in live:
+        write(f'covers/{p["slug"]}.svg', cover_svg(p))
     write("favicon.svg", FAVICON)
     for name, (w, h) in {"favicon-32.png": (32, 32), "apple-touch-icon.png": (180, 180), "icon-192.png": (192, 192),
                          "icon-512.png": (512, 512), "og-image.png": (1200, 630)}.items():
@@ -495,7 +549,7 @@ def build():
         if p["category"] == "health":
             note += " This is general information, not medical advice; talk to a doctor about your own health."
         body = (f'<article class="post"><div class="crumb"><a href="/">Home</a> / <a href="/{p["category"]}/">{p["category"].title()}</a></div>'
-                f'<h1>{html.escape(p["title"])}</h1><div class="meta">{p["date"]} · {rt(p)} min read</div>{share}{md(p["body"])}'
+                f'<h1>{html.escape(p["title"])}</h1><div class="meta">{p["date"]} · {rt(p)} min read</div><img class="hero-img" src="/covers/{p["slug"]}.svg" alt="{html.escape(p["title"])}">{share}{md(p["body"])}'
                 + (f"<h2>Sources</h2><ul>{src}</ul>" if src else "") + f'<div class="note">{note}</div></article>'
                 + (f'<div class="sec"><h2>Related</h2></div>{grid(rel)}' if rel else ""))
         write(u.lstrip("/"), page(p["title"], body, p["description"], u, "article", ld))
