@@ -1,68 +1,736 @@
-name: Write articles and publish
-on:
-  push:
-    branches: [main]
-    paths: ["posts/**", "autoblog.py", ".github/workflows/**"]
-  schedule:
-    - cron: "0 */8 * * *"
-  workflow_dispatch:
-permissions:
-  contents: write
-  pages: write
-  id-token: write
-concurrency:
-  group: pages
-  cancel-in-progress: false
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      MAX_POSTS: "2"
-      PYTHONUNBUFFERED: "1"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Check the Google key
-        if: github.event_name != 'push'
-        continue-on-error: true
-        timeout-minutes: 5
-        run: |
-          if [ -z "$GEMINI_API_KEY" ]; then echo "::error::Secret GEMINI_API_KEY is missing or named wrong"; exit 1; fi
-          python autoblog.py check
-      - name: Write articles
-        if: github.event_name != 'push'
-        continue-on-error: true
-        timeout-minutes: 15
-        run: python autoblog.py run
-      - name: Publish good articles
-        if: github.event_name != 'push'
-        run: python autoblog.py approve --good
-      - name: Save new articles
-        if: github.event_name != 'push'
-        run: |
-          git config user.name autoblog
-          git config user.email bot@users.noreply.github.com
-          git add posts
-          git diff --cached --quiet || (git commit -m "New articles" && git push)
-      - name: Build website
-        run: |
-          OWNER="${GITHUB_REPOSITORY_OWNER,,}"; REPO="${GITHUB_REPOSITORY#*/}"; REPO="${REPO,,}"
-          if [ "$REPO" = "$OWNER.github.io" ]; then export SITE_URL="https://$OWNER.github.io"; else export SITE_URL="https://$OWNER.github.io/$REPO"; fi
-          echo "Site address: $SITE_URL"
-          python autoblog.py build
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: site
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.d.outputs.page_url }}
-    steps:
-      - id: d
-        uses: actions/deploy-pages@v4
+#!/usr/bin/env python3
+"""AI autoblog: trends -> categorize -> research -> write -> quality gate
+-> save by category (draft) -> approve -> build static site.
+
+Usage:
+  python autoblog.py run               # find trends, write drafts into posts/<category>/
+  python autoblog.py list              # show all posts and their status
+  python autoblog.py approve <slug>    # publish one draft (or: approve --all)
+  python autoblog.py build             # generate the website into site/
+Free AI: set GEMINI_API_KEY (Google AI Studio). Paid: pip install anthropic + ANTHROPIC_API_KEY.
+"""
+import os, sys, re, json, html, datetime, urllib.request, urllib.parse, urllib.error, time
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+ROOT = Path(__file__).parent
+POSTS, SITE = ROOT / "posts", ROOT / "site"
+OWNER = os.getenv("OWNER_NAME", "Rajuyesu")   # shown as publisher/author
+SITE_NAME = os.getenv("BLOG_NAME", "Trenddesk")   # not SITE_NAME: Netlify overwrites that one
+GEO = os.getenv("TRENDS_GEO", "IN")                 # country code for trends
+MODEL = os.getenv("MODEL", "claude-sonnet-5-5")
+MAX_POSTS = int(os.getenv("MAX_POSTS", "3"))        # drafts per run
+MIN_SCORE = 7                                       # quality gate (1-10)
+
+CATEGORIES = {
+    "technology": "Gadgets, software, AI, internet and science news",
+    "health": "General wellness, sleep, nutrition, fitness and mental health explainers (information only)",
+    "business": "Companies, markets, startups, economy (explain, never give investment advice)",
+    "entertainment": "Films, series, music, gaming, pop culture",
+    "sports": "Matches, tournaments, athletes, results",
+    "lifestyle": "Travel, food, shopping, everyday how-tos",
+}
+# Auto-skip: tragedies, unverified rumours, personal medical/legal/financial advice (general explainers are fine), adult or hateful topics.
+AVOID = "breaking tragedies or deaths, unverified rumours, medical/legal/financial advice, adult or hateful content"
+
+STYLE = """You are a staff writer for a trend-explainer site. Write like a sharp, friendly human editor:
+- Open with why this matters right now, not with filler.
+- Concrete facts, names, dates and numbers from the sources only. Never invent quotes or stats.
+- One clear point of view or takeaway; vary sentence length; short paragraphs.
+- Use ## subheadings, 900-1200 words, only as long as the sources support (never pad), end with a short 'What to watch' section.
+- Cite sources inline as markdown links. Do not copy source wording.
+- Health topics: general information only, from reputable bodies (WHO, CDC, NHS). No diagnoses, doses or cures; say when to see a doctor."""
+
+
+WORKING = {"model": None}
+
+
+def gem(prompt, system=""):
+    """Free Gemini API. Tries several model names (Google retires them often) and remembers the one that works."""
+    key = os.environ["GEMINI_API_KEY"].strip()
+    models = [m for m in (WORKING["model"], os.getenv("GEMINI_MODEL"), "gemini-flash-latest", "gemini-3-flash-preview",
+                          "gemini-2.5-flash", "gemini-3.5-flash-lite") if m]
+    err = "no model tried"
+    for m in dict.fromkeys(models):
+        body = {"contents": [{"parts": [{"text": prompt}]}]}
+        if system:
+            body["systemInstruction"] = {"parts": [{"text": system}]}
+        req = urllib.request.Request(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
+            data=json.dumps(body).encode(), headers={"Content-Type": "application/json", "x-goog-api-key": key})
+        try:
+            r = json.load(urllib.request.urlopen(req, timeout=90))
+            WORKING["model"] = m
+            print(f"  (model {m})", flush=True)
+            return "".join(p.get("text", "") for p in r["candidates"][0]["content"]["parts"])
+        except urllib.error.HTTPError as e:
+            err = f"{m}: HTTP {e.code} {e.read()[:150]!r}"
+            print("  !", err, flush=True)
+            if e.code == 429:
+                time.sleep(10)
+        except Exception as e:
+            err = f"{m}: {e}"
+            print("  !", err, flush=True)
+    raise RuntimeError("Gemini failed - " + err)
+
+
+def llm(prompt, system="", max_tokens=4000):
+    if os.getenv("GEMINI_API_KEY"):          # free option
+        return gem(prompt, system)
+    import anthropic                          # paid option
+    r = anthropic.Anthropic().messages.create(model=MODEL, max_tokens=max_tokens, system=system,
+                                              messages=[{"role": "user", "content": prompt}])
+    return "".join(b.text for b in r.content if b.type == "text")
+
+
+def jload(text):
+    return json.loads(re.search(r"\{.*\}|\[.*\]", text, re.S).group(0))
+
+
+# ---------- 1. trends + their real news sources (no paid search needed) ----------
+def get(url, timeout=20):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    return urllib.request.urlopen(req, timeout=timeout).read()
+
+
+def strip_html(s):
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", s or ""))).strip()
+
+
+def _txt(node, name):
+    for c in node.iter():
+        if c.tag.split("}")[-1] == name and c.text:
+            return strip_html(c.text)
+    return ""
+
+
+def fetch_trends():
+    """-> [{"title": str, "sources": [{"title","url","snippet"}]}]"""
+    out = []
+    try:
+        root = ET.fromstring(get(f"https://trends.google.com/trending/rss?geo={GEO}"))
+        for it in root.iter("item"):
+            srcs = [{"title": _txt(n, "news_item_title"), "url": _txt(n, "news_item_url"), "snippet": _txt(n, "news_item_snippet")}
+                    for n in it if n.tag.split("}")[-1] == "news_item"]
+            if it.findtext("title"):
+                out.append({"title": it.findtext("title"), "sources": [s for s in srcs if s["url"]]})
+    except Exception as e:
+        print("! Google Trends unavailable:", e, flush=True)
+    if not out:                                   # fallback: Google News headlines
+        for topic in ("TECHNOLOGY", "BUSINESS", "ENTERTAINMENT", "SPORTS", "HEALTH"):
+            try:
+                root = ET.fromstring(get(f"https://news.google.com/rss/headlines/section/topic/{topic}?hl=en-{GEO}&gl={GEO}&ceid={GEO}:en"))
+                for it in list(root.iter("item"))[:6]:
+                    t = strip_html(it.findtext("title"))
+                    out.append({"title": t, "sources": [{"title": t, "url": it.findtext("link") or "", "snippet": strip_html(it.findtext("description"))}]})
+            except Exception as e:
+                print("! news feed failed:", topic, e, flush=True)
+    return out
+
+
+def page_text(url):
+    try:
+        raw = get(url, 12)[:300000].decode("utf-8", "ignore")
+        raw = re.sub(r"(?is)<(script|style|nav|footer|header)[^>]*>.*?</\1>", " ", raw)
+        return strip_html(raw)[:2500]
+    except Exception:
+        return ""
+
+
+# ---------- 2. pick + categorize ----------
+def categorize(trends):
+    cand = [t for t in trends if len(t["sources"]) >= 2] or [t for t in trends if t["sources"]]
+    if not cand:
+        return []
+    listing = "\n".join(f'{i}: {t["title"]}' for i, t in enumerate(cand))
+    prompt = (f"Categories: {json.dumps(CATEGORIES)}\nAvoid: {AVOID}\nTrending searches (id: topic):\n{listing}\n"
+              f"Pick up to {MAX_POSTS} that fit a category and can support a useful, factual explainer. "
+              'Return a JSON list: [{"id":0,"category":"","angle":"one-line original angle"}]. JSON only.')
+    return [(cand[int(x["id"])], x) for x in jload(llm(prompt))[:MAX_POSTS] if 0 <= int(x["id"]) < len(cand)]
+
+
+# ---------- 3-5. research (real sources), write, quality gate ----------
+def write_post(trend, pick):
+    srcs = trend["sources"][:4]
+    pack = []
+    for s in srcs:
+        s["text"] = page_text(s["url"])
+        pack.append(f'SOURCE: {s["title"]}\nURL: {s["url"]}\nSNIPPET: {s["snippet"]}\nPAGE TEXT: {s["text"]}')
+    material = "\n\n".join(pack)
+    if not any(s["snippet"] or s["text"] for s in srcs):
+        return None                              # never write without real source material
+    grounded = sum(1 for s in srcs if s["snippet"] or s["text"]) >= 2
+    draft = llm("Topic: " + trend["title"] + "\nCategory: " + pick["category"] + "\nAngle: " + str(pick.get("angle", "")) +
+                "\nWrite the article using ONLY the source material below. Do not add facts that the sources do not support. "
+                'If the material is too thin for a useful article, return {"skip": true}. Otherwise return JSON only: '
+                '{"title":"","description":"max 155 chars","tags":["",""],"body":"markdown"}\n\n' + material,
+                system=STYLE, max_tokens=6000)
+    post = jload(draft)
+    if post.get("skip"):
+        return None
+    post["sources"] = [{"title": s["title"] or s["url"], "url": s["url"]} for s in srcs]
+    review = jload(llm("Review this draft as a strict editor against the sources. Score 1-10 for accuracy (every claim supported), "
+                       'originality and usefulness. Return JSON only: {"score":0,"problems":[""]}\n\nSOURCES:\n' + material +
+                       "\n\nDRAFT:\n" + post["body"]))
+    post["score"] = review["score"] if grounded else min(review["score"], 7)   # thin sources -> stays a draft
+    return post if review["score"] >= MIN_SCORE else None
+
+
+# ---------- 6. save by category ----------
+def slugify(s):
+    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:60]
+
+
+def save(post, category, trend_title=""):
+    d = POSTS / category
+    d.mkdir(parents=True, exist_ok=True)
+    date = datetime.date.today().isoformat()
+    slug = f"{date}-{slugify(post['title'])}"
+    if (d / f"{slug}.md").exists():
+        return slug + " (already exists, kept)"
+    meta = {"title": post["title"], "description": post["description"], "category": category,
+            "date": date, "tags": post["tags"], "sources": post["sources"],
+            "score": post["score"], "trend": trend_title, "status": "draft"}
+    text = "".join(f"{k}: {json.dumps(v, ensure_ascii=False)}\n" for k, v in meta.items())
+    (d / f"{slug}.md").write_text(f"---\n{text}---\n{post['body']}\n", encoding="utf-8")
+    return slug
+
+
+def check():
+    """Test everything: python autoblog.py check"""
+    print("Writing test:", llm("Reply with the single word OK.").strip()[:40], flush=True)
+    t = fetch_trends()
+    print(f"Trends found: {len(t)} (with 2+ news sources: {sum(1 for x in t if len(x['sources']) >= 2)})", flush=True)
+
+
+def update_post(path, new_body=None, **kv):
+    raw = path.read_text(encoding="utf-8")
+    _, head, body = raw.split("---\n", 2)
+    lines = [l for l in head.splitlines() if l.split(": ", 1)[0] not in kv]
+    lines += [k + ": " + json.dumps(v, ensure_ascii=False) for k, v in kv.items()]
+    path.write_text("---\n" + "\n".join(lines) + "\n---\n" + (new_body if new_body is not None else body), encoding="utf-8")
+
+
+def find_image(term):
+    """Real, openly licensed photo from Openverse (no key needed). Returns (image or None, api_ok)."""
+    try:
+        q = urllib.parse.urlencode({"q": term, "page_size": 10, "license_type": "commercial", "aspect_ratio": "wide", "mature": "false"})
+        data = json.loads(get("https://api.openverse.org/v1/images/?" + q, 20))
+        for r in data.get("results", []):
+            if r.get("url") and r.get("thumbnail") and (r.get("width") or 1000) >= 800:
+                lic = (r.get("license") or "").upper() + " " + (r.get("license_version") or "")
+                return ({"thumb": r["thumbnail"], "url": r["url"], "credit": (r.get("title") or "Photo") + " by " + (r.get("creator") or "unknown"),
+                         "license": lic.strip(), "license_url": r.get("license_url") or "", "link": r.get("foreign_landing_url") or r["url"]}, True)
+        return None, True
+    except Exception as e:
+        print("  ! image search failed:", e, flush=True)
+        return None, False
+
+
+def attach_images(limit=5):
+    done = 0
+    for p in all_posts():
+        if done >= limit:
+            break
+        if "image" in p:
+            continue
+        terms = [t for t in (" ".join(p["tags"][:2]), p["tags"][0] if p["tags"] else "", p["category"]) if t]
+        img, ok = None, True
+        for term in terms:
+            img, ok = find_image(term)
+            if img or not ok:
+                break
+        if not ok:
+            return                                  # service down: try again next run
+        update_post(p["path"], image=img)           # null = none found, do not retry forever
+        done += 1
+        print("  image:", p["slug"], "found" if img else "none", flush=True)
+        time.sleep(1)
+
+
+def expand_one():
+    """Short placeholder articles are rewritten into full-length ones, one per run."""
+    for p in all_posts():
+        if p["status"] != "published" or "about" in p["tags"] or len(p["body"].split()) >= 250 or p.get("expand_tries", 0) >= 2:
+            continue
+        update_post(p["path"], expand_tries=p.get("expand_tries", 0) + 1)
+        material = "\n\n".join("SOURCE TEXT (" + s["url"] + "): " + page_text(s["url"]) for s in p["sources"][:3])
+        res = jload(llm("Expand this short article into a complete, well-structured explainer of 900-1100 words. Use only widely established, "
+                        "well-known facts" + (" and the source text below" if material else "") + ". Do not invent statistics, studies or quotes. "
+                        "Keep health content cautious and general. Keep the same topic. Use ## subheadings and end with a 'What to watch' section. "
+                        'Return JSON only: {"body":"markdown"}\n\nTITLE: ' + p["title"] + "\nCURRENT TEXT:\n" + p["body"] + "\n\n" + material,
+                        system=STYLE, max_tokens=6000))
+        body = res["body"]
+        rev = jload(llm('Strict editor: score 1-10 for accuracy (penalise invented specifics) and quality. JSON only: {"score":0}\n\n' + body))
+        if rev["score"] >= 8 and len(body.split()) > 400:
+            update_post(p["path"], new_body=body + "\n")
+            print("expanded:", p["slug"], flush=True)
+        else:
+            print("expansion rejected:", p["slug"], flush=True)
+        return
+
+
+def run():
+    try:
+        seen = {p.get("trend") for p in all_posts()}
+        trends = [t for t in fetch_trends() if t["title"] not in seen]
+        picks = categorize(trends)
+    except Exception as e:
+        print("! could not pick topics:", e, flush=True)
+        picks = []
+    for trend, pick in picks:
+        if pick.get("category") not in CATEGORIES:
+            continue
+        print("writing:", trend["title"], flush=True)
+        post = None
+        for attempt in (1, 2):
+            try:
+                post = write_post(trend, pick)
+                break
+            except Exception as e:
+                print("! attempt", attempt, "failed:", e, flush=True)
+        print(("saved draft: " + save(post, pick["category"], trend["title"])) if post else "skipped: " + trend["title"], flush=True)
+    for step in (attach_images, expand_one):
+        try:
+            step()
+        except Exception as e:
+            print("! extra step failed:", step.__name__, e, flush=True)
+
+
+# ---------- posts io ----------
+def load_post(path):
+    raw = path.read_text(encoding="utf-8")
+    head, body = raw.split("---\n", 2)[1:]
+    meta = {}
+    for line in head.splitlines():
+        k, v = line.split(": ", 1)
+        meta[k] = json.loads(v)
+    meta["body"], meta["slug"], meta["path"] = body, path.stem, path
+    return meta
+
+
+def all_posts():
+    return sorted((load_post(p) for p in POSTS.rglob("*.md")), key=lambda p: p["date"], reverse=True)
+
+
+def approve(arg):
+    for p in all_posts():
+        if p["status"] == "draft" and (arg == "--all" or p["slug"] == arg or (arg == "--good" and p["score"] >= 8)):
+            t = p["path"].read_text(encoding="utf-8").replace('status: "draft"', 'status: "published"', 1)
+            p["path"].write_text(t, encoding="utf-8")
+            print("published:", p["slug"])
+
+
+# ---------- 7. build site ----------
+def inline(s):
+    s = html.escape(s)
+    s = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
+    return re.sub(r"\[(.+?)\]\((https?://[^)\s]+)\)", r'<a href="\2" rel="noopener">\1</a>', s)
+
+
+def md(text):
+    out, items = [], []
+    flush = lambda: (out.append("<ul>" + "".join(items) + "</ul>"), items.clear()) if items else None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith(("- ", "* ")):
+            items.append(f"<li>{inline(line[2:])}</li>")
+            continue
+        flush()
+        if line.startswith("### "): out.append(f"<h3>{inline(line[4:])}</h3>")
+        elif line.startswith("## "): out.append(f"<h2>{inline(line[3:])}</h2>")
+        elif line: out.append(f"<p>{inline(line)}</p>")
+    flush()
+    return "\n".join(out)
+
+
+URL = (os.getenv("SITE_URL") or os.getenv("URL") or "https://your-site.netlify.app").rstrip("/")
+COLORS = {"technology": ("#2563eb", "#7c3aed", "💻"), "business": ("#059669", "#0d9488", "📈"),
+          "entertainment": ("#db2777", "#f59e0b", "🎬"), "sports": ("#ea580c", "#dc2626", "🏆"),
+          "lifestyle": ("#7c3aed", "#ec4899", "✨"), "health": ("#0d9488", "#22c55e", "🩺")}
+
+CSS = """:root{--bg:#fff;--fg:#14161a;--mut:#667085;--ac:#2563eb;--line:#e5e7eb;--card:#f8fafc}
+[data-theme=dark]{--bg:#0e1116;--fg:#eceef2;--mut:#9aa3b2;--ac:#7aa7ff;--line:#262b34;--card:#151a22}
+*{box-sizing:border-box}html{scroll-behavior:smooth}
+body{display:flex;flex-direction:column;min-height:100vh;margin:0;background:var(--bg);color:var(--fg);font:17px/1.7 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+a{color:inherit;text-decoration:none}.w{width:100%;max-width:1100px;margin:auto;padding:0 20px}main.w{flex:1;margin:0 auto}.sl{display:none}
+header{position:sticky;top:0;z-index:9;background:var(--bg);border-bottom:1px solid var(--line)}
+.bar{display:flex;align-items:center;gap:18px;height:64px}.logo{font-weight:800;font-size:22px;letter-spacing:-.5px}
+.logo b{color:var(--ac)}nav{display:flex;gap:4px;overflow-x:auto;flex:1}
+nav a{padding:6px 12px;border-radius:99px;font-size:15px;color:var(--mut);text-transform:capitalize;white-space:nowrap}
+nav a:hover{background:var(--card);color:var(--fg)}
+.sf input{border:1px solid var(--line);background:var(--card);color:var(--fg);padding:8px 14px;border-radius:99px;width:170px;font:inherit;font-size:14px}
+#tg{border:1px solid var(--line);background:var(--card);color:var(--fg);width:38px;height:38px;border-radius:50%;cursor:pointer;font-size:16px}
+.hero{padding:36px 0 8px}.hero h1{font-size:clamp(28px,5vw,46px);line-height:1.15;letter-spacing:-1px;margin:0 0 8px}
+.hero p{color:var(--mut);margin:0}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:24px;margin:24px 0}
+.card{border:1px solid var(--line);border-radius:16px;overflow:hidden;background:var(--card);transition:.2s}
+.card:hover{transform:translateY(-3px);box-shadow:0 10px 30px rgba(0,0,0,.12)}
+.card.big{display:grid;grid-template-columns:1.1fr 1fr;margin:24px 0}.card.big .th{height:100%;min-height:260px}.card.big h3{font-size:28px}
+.th{height:160px;display:flex;align-items:center;justify-content:center}.th span{font-size:54px;filter:drop-shadow(0 4px 8px rgba(0,0,0,.25))}
+.cb{padding:18px}.cb h3{margin:6px 0;font-size:20px;line-height:1.3}.cb p{margin:0 0 10px;color:var(--mut);font-size:15px}
+.tag{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--ac)}
+.meta{font-size:13px;color:var(--mut)}.sec{display:flex;justify-content:space-between;align-items:baseline;margin-top:40px}
+.sec h2{margin:0;font-size:24px;text-transform:capitalize}.sec a{color:var(--ac);font-size:14px}
+article.post{max-width:720px;margin:36px auto}article.post h1{font-size:clamp(28px,5vw,42px);line-height:1.15;letter-spacing:-1px;margin:8px 0}
+.post h2{margin-top:2em;font-size:26px}.post p,.post li{font-size:18px;line-height:1.8}.post a{color:var(--ac);text-decoration:underline}
+.crumb{font-size:14px;color:var(--mut)}.share{display:flex;gap:10px;margin:24px 0}
+.share a,.share button{border:1px solid var(--line);background:var(--card);color:var(--fg);padding:7px 14px;border-radius:99px;font:inherit;font-size:14px;cursor:pointer}
+.note{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px;font-size:14px;color:var(--mut);margin:28px 0}
+.card2{padding:16px 0;border-bottom:1px solid var(--line)}#q{width:100%;padding:12px 16px;border:1px solid var(--line);border-radius:12px;background:var(--card);color:var(--fg);font:inherit;margin:16px 0}
+footer{border-top:1px solid var(--line);margin-top:60px;padding:40px 0 24px;background:var(--card);color:var(--mut);font-size:14px}footer .fg{display:grid;grid-template-columns:2fr 1fr 1fr;gap:30px}footer p{margin:8px 0;max-width:340px}footer h4{margin:0 0 8px;color:var(--fg);font-size:13px;text-transform:uppercase;letter-spacing:.08em}footer a{display:block;margin:6px 0}footer a:hover{color:var(--ac)}footer .fb{display:flex;justify-content:space-between;border-top:1px solid var(--line);margin-top:28px;padding-top:16px}
+@media(max-width:900px){.card.big{grid-template-columns:1fr}.card.big .th{min-height:180px}.sf{display:none}.sl{display:block}footer .fg{grid-template-columns:1fr 1fr}}"""
+
+
+CSS += """
+footer{border-top:1px solid var(--line);margin-top:60px;padding:40px 0 24px;color:var(--mut);font-size:14px;background:var(--card)}
+.fg{display:grid;grid-template-columns:2fr 1fr 1fr;gap:32px}footer h4{margin:0 0 10px;color:var(--fg);font-size:15px}
+footer .fg a{display:block;padding:3px 0}footer a:hover{color:var(--ac)}footer p{margin:8px 0 0;max-width:340px}
+.fb{margin-top:28px;padding-top:18px;border-top:1px solid var(--line)}
+.fm{display:grid;gap:12px;max-width:560px}.fm input,.fm textarea{width:100%;padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--fg);font:inherit}
+.fm button{justify-self:start;background:var(--ac);color:#fff;border:0;padding:12px 24px;border-radius:99px;font:inherit;cursor:pointer}
+@media(max-width:900px){.fg{grid-template-columns:1fr 1fr}}"""
+
+CSS += ".cv{width:100%;height:170px;object-fit:cover;display:block}.card.big .cv{height:100%;min-height:260px}.hero-img{width:100%;border-radius:16px;margin:18px 0;display:block}"
+
+CSS = ":root{--bg:#fbfaf7;--fg:#141414;--mut:#5f6368;--ac:#b3261e;--line:#ddd9cf;--card:#fff;--hf:'Playfair Display',Georgia,'Times New Roman',serif;--bf:'Source Serif 4',Georgia,serif;--uf:Inter,system-ui,-apple-system,'Segoe UI',Roboto,sans-serif}\n[data-theme=dark]{--bg:#0f1115;--fg:#ececec;--mut:#a3a9b3;--ac:#ff7466;--line:#2a2e36;--card:#161a21}\n*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);color:var(--fg);font:17px/1.6 var(--uf)}\na{color:inherit;text-decoration:none}img{max-width:100%;display:block}.w{max-width:1180px;margin:auto;padding:0 20px}\n.top{border-bottom:1px solid var(--line);font-size:12px;color:var(--mut);padding:7px 0}.top .w{display:flex;justify-content:space-between;gap:12px}\n.mast{text-align:center;padding:22px 0 16px}.mast a.logo{font:800 clamp(36px,7vw,66px)/1 var(--hf);letter-spacing:-1.5px}\n.logo b{color:var(--ac)}.mast p{margin:8px 0 0;font-size:11px;letter-spacing:.22em;text-transform:uppercase;color:var(--mut)}\nheader.nv{position:sticky;top:0;z-index:20;background:var(--bg);border-top:3px double var(--fg);border-bottom:1px solid var(--fg)}\n.nv .w{display:flex;align-items:center;gap:8px}.nv nav{display:flex;flex:1;overflow-x:auto;scrollbar-width:none}\n.nv nav a{padding:12px 13px;font:600 12.5px var(--uf);text-transform:uppercase;letter-spacing:.07em;white-space:nowrap}.nv nav a:hover{color:var(--ac)}\n.sf input{border:1px solid var(--line);background:var(--card);color:var(--fg);padding:7px 12px;border-radius:99px;width:150px;font:inherit;font-size:13px}\n#tg{border:1px solid var(--line);background:var(--card);color:var(--fg);width:34px;height:34px;border-radius:50%;cursor:pointer}\n.lead{display:grid;grid-template-columns:1.75fr 1fr;gap:34px;padding:28px 0;border-bottom:1px solid var(--line)}\n.big .im img{width:100%;aspect-ratio:16/9;object-fit:cover}.big h2{font:700 clamp(28px,4vw,44px)/1.14 var(--hf);margin:10px 0}\n.big p{font:19px/1.6 var(--bf);color:var(--mut);margin:0 0 10px}\n.kick{font:700 11.5px var(--uf);letter-spacing:.12em;text-transform:uppercase;color:var(--ac)}.meta{font:12px var(--uf);color:var(--mut)}\n.sh{font:800 15px var(--hf);text-transform:uppercase;letter-spacing:.07em;border-bottom:2px solid var(--fg);padding-bottom:6px;margin:0 0 4px}\n.row{display:grid;grid-template-columns:108px 1fr;gap:14px;padding:14px 0;border-bottom:1px solid var(--line)}\n.row img{width:108px;height:74px;object-fit:cover}.row h3{font:700 17px/1.3 var(--hf);margin:3px 0 5px}\n.sec{display:flex;justify-content:space-between;align-items:baseline;border-bottom:2px solid var(--fg);margin:42px 0 22px;padding-bottom:7px}\n.sec h2{font:800 23px var(--hf);margin:0;text-transform:capitalize}.sec a{font:600 12px var(--uf);color:var(--ac);text-transform:uppercase;letter-spacing:.08em}\n.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:30px}.card img{width:100%;aspect-ratio:3/2;object-fit:cover}\n.card h3{font:700 20px/1.25 var(--hf);margin:9px 0 6px}.card p{font:15px/1.55 var(--bf);color:var(--mut);margin:0 0 8px;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}\n.card:hover h3,.row:hover h3,.big:hover h2{color:var(--ac)}\n.cols{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:52px;padding-top:30px}\n.art h1{font:800 clamp(30px,5vw,50px)/1.12 var(--hf);margin:8px 0 12px;letter-spacing:-.5px}.deck{font:21px/1.5 var(--bf);color:var(--mut);margin:0 0 16px}\n.by{font:13px var(--uf);color:var(--mut);border-top:1px solid var(--line);border-bottom:1px solid var(--line);padding:10px 0;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}\nfigure{margin:22px 0}figure img{width:100%}figcaption{font:12px var(--uf);color:var(--mut);margin-top:7px}\n.body{font:19px/1.85 var(--bf)}.body>p:first-child{font-size:21px}.body h2{font:700 28px/1.25 var(--hf);margin:1.7em 0 .4em}\n.body a,.post a{color:var(--ac);text-decoration:underline}.body li{margin:.3em 0}\n.src{border-top:2px solid var(--fg);margin-top:34px;padding-top:12px;font:14px var(--uf)}.src h3{font:800 15px var(--hf);text-transform:uppercase;letter-spacing:.07em;margin:0 0 6px}\n.note{font:13px var(--uf);color:var(--mut);background:var(--card);border-left:3px solid var(--ac);padding:10px 14px;margin:24px 0}\n.share{display:flex;gap:8px;margin:20px 0;flex-wrap:wrap}.share a,.share button,.chip{border:1px solid var(--line);background:var(--card);color:var(--fg);padding:6px 14px;border-radius:99px;font:13px var(--uf);cursor:pointer}\n.chips{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.chip:hover,.share a:hover{border-color:var(--ac);color:var(--ac)}\n.hero{padding:34px 0 6px}.hero h1{font:800 clamp(30px,5vw,46px)/1.15 var(--hf);margin:0 0 8px}.hero p,.desc{color:var(--mut);margin:0}\narticle.post{max-width:760px;margin:34px auto}article.post h1{font:800 clamp(30px,5vw,44px)/1.15 var(--hf)}article.post h2{font:700 25px var(--hf);margin-top:1.8em}\narticle.post p,article.post li{font:18px/1.8 var(--bf)}.crumb{font:13px var(--uf);color:var(--mut)}\n.card2{padding:16px 0;border-bottom:1px solid var(--line)}#q{width:100%;padding:12px 16px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--fg);font:inherit;margin:16px 0}\n.fm{display:grid;gap:12px;max-width:560px}.fm input,.fm textarea{width:100%;padding:12px 14px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);font:inherit}\n.fm button{justify-self:start;background:var(--ac);color:#fff;border:0;padding:12px 26px;border-radius:99px;font:inherit;cursor:pointer}\nfooter{background:#111;color:#bdbdbd;margin-top:64px;padding:44px 0 22px;font:14px var(--uf)}footer .logo{font:800 28px var(--hf);color:#fff}\n.fg{display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:32px}footer h4{margin:0 0 10px;color:#fff;font-size:13px;text-transform:uppercase;letter-spacing:.1em}\nfooter .fg a{display:block;padding:3px 0}footer a:hover{color:#fff}footer p{margin:8px 0 0;max-width:330px}.fb{margin-top:30px;padding-top:18px;border-top:1px solid #333;font-size:12.5px}\n@media(max-width:1000px){.lead,.cols{grid-template-columns:1fr}.grid{grid-template-columns:1fr 1fr}.fg{grid-template-columns:1fr 1fr}.sf{display:none}}\n@media(max-width:700px){.grid{grid-template-columns:1fr}.top .w span:last-child{display:none}.mast p{letter-spacing:.1em;padding:0 12px}.row{grid-template-columns:96px 1fr}.row img{width:96px;height:68px}}"
+
+FAVICON = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
+           '<stop offset="0" stop-color="#2563eb"/><stop offset="1" stop-color="#7c3aed"/></linearGradient></defs>'
+           '<rect width="64" height="64" rx="14" fill="url(#g)"/><path d="M16 17h32v8H36v22h-8V25H16z" fill="#fff"/></svg>')
+
+
+def icon_png(w, h):
+    """Pure-python PNG: blue-purple gradient with a white T (no image libraries needed)."""
+    import zlib, struct
+    s = min(w, h)
+    ox, oy = (w - s) / 2, (h - s) / 2
+    rows = []
+    for y in range(h):
+        row = bytearray(b"\x00")
+        v = (y - oy) / s
+        for x in range(w):
+            u = (x - ox) / s
+            if (0.25 <= u <= 0.75 and 0.265 <= v <= 0.39) or (0.4375 <= u <= 0.5625 and 0.39 <= v <= 0.73):
+                row += b"\xff\xff\xff"
+            else:
+                t = (x / w + y / h) / 2
+                row += bytes((int(37 + 87 * t), int(99 - 41 * t), int(235 + 2 * t)))
+        rows.append(bytes(row))
+    def chunk(k, d):
+        c = struct.pack(">I", len(d)) + k + d
+        return c + struct.pack(">I", zlib.crc32(k + d) & 0xffffffff)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"".join(rows), 9)) + chunk(b"IEND", b""))
+
+
+def footer_html():
+    secs = "".join('<a href="/' + c + '/">' + c.title() + "</a>" for c in CATEGORIES)
+    co = "".join('<a href="/' + u + '.html">' + n + "</a>" for u, n in [("about", "About us"), ("contact", "Contact"),
+         ("privacy", "Privacy Policy"), ("terms", "Terms &amp; Conditions"), ("disclaimer", "Disclaimer")])
+    more = '<a href="/rss.xml">RSS feed</a><a href="/sitemap.xml">Sitemap</a><a href="/search.html">Search</a>'
+    return ('<footer><div class="w fg"><div><div class="logo">' + esc(SITE_NAME) + '<b style="color:#ff7466">.</b></div>'
+            "<p>Independent explainers on what the world is searching for, with sources on every story.</p></div>"
+            "<div><h4>Sections</h4>" + secs + "</div><div><h4>Company</h4>" + co + "</div><div><h4>More</h4>" + more + "</div></div>"
+            '<div class="w fb">© ' + str(datetime.date.today().year) + " " + esc(SITE_NAME) + ". Published by " + esc(OWNER) +
+            '. Written with AI assistance and edited before publication (<a href="/about.html" style="text-decoration:underline">how we work</a>). '
+            "Health and finance articles are general information, not professional advice.</div></footer>")
+
+
+def rt(p):
+    return max(1, len(p["body"].split()) // 200)
+
+
+def page(title, body, desc="", path="/", kind="website", ld="", noindex=False, image=None):
+    t = esc(title if title == SITE_NAME else title + " | " + SITE_NAME)
+    d = esc(desc or SITE_NAME + ": independent, sourced explainers on what the world is searching for.")
+    nav = "".join('<a href="/' + c + '/">' + c + "</a>" for c in CATEGORIES)
+    robots = "noindex,follow" if noindex else "index,follow,max-image-preview:large"
+    img = image or (URL + "/og-image.png")
+    u = URL + path
+    head = ('<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' + t + "</title>"
+            '<meta name="description" content="' + d + '"><meta name="robots" content="' + robots + '"><meta name="theme-color" content="#b3261e">'
+            '<link rel="canonical" href="' + u + '"><meta property="og:site_name" content="' + esc(SITE_NAME) + '">'
+            '<meta property="og:title" content="' + t + '"><meta property="og:description" content="' + d + '">'
+            '<meta property="og:type" content="' + kind + '"><meta property="og:url" content="' + u + '"><meta property="og:image" content="' + img + '">'
+            '<meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="' + t + '">'
+            '<meta name="twitter:description" content="' + d + '"><meta name="twitter:image" content="' + img + '">'
+            '<link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png">'
+            '<link rel="apple-touch-icon" href="/apple-touch-icon.png"><link rel="manifest" href="/site.webmanifest">'
+            '<link rel="alternate" type="application/rss+xml" title="' + esc(SITE_NAME) + '" href="/rss.xml">'
+            '<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+            '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=Playfair+Display:wght@600;700;800&amp;family=Source+Serif+4:wght@400;600&amp;display=swap">'
+            '<link rel="stylesheet" href="/style.css">')
+    theme = "<script>try{document.documentElement.dataset.theme=localStorage.theme||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light')}catch(e){}</script>"
+    toggle = ("<button id=tg aria-label=\"Toggle dark mode\" onclick=\"var d=document.documentElement;d.dataset.theme=d.dataset.theme=='dark'?'light':'dark';"
+              "try{localStorage.theme=d.dataset.theme}catch(e){}\">◐</button>")
+    today = datetime.date.today().strftime("%A, %d %B %Y")
+    return ('<!doctype html><html lang="en"><head>' + head + theme + ld + '</head><body id="top">'
+            '<div class="top"><div class="w"><span>' + today + "</span><span>Published by " + esc(OWNER) + "</span></div></div>"
+            '<div class="mast"><a class="logo" href="/">' + esc(SITE_NAME) + "<b>.</b></a><p>Explainers on what the world is searching for</p></div>"
+            '<header class="nv"><div class="w"><nav>' + nav + '</nav><form class="sf" action="/search.html"><input name="q" placeholder="Search…" aria-label="Search"></form>'
+            + toggle + '</div></header><main class="w">' + body + "</main>" + footer_html() + "</body></html>")
+
+
+def cover_svg(p):
+    import random
+    r = random.Random(p["slug"])
+    a, b, e = COLORS[p["category"]]
+    shapes = "".join(f'<circle cx="{r.randint(0, 1200)}" cy="{r.randint(0, 630)}" r="{r.randint(60, 260)}" fill="#fff" opacity="{r.choice([.07, .11, .15])}"/>' for _ in range(7))
+    x2, y2 = r.choice([(1, 1), (1, 0), (0, 1)])
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630"><defs><linearGradient id="g" x1="0" y1="0" x2="{x2}" y2="{y2}">'
+            f'<stop offset="0" stop-color="{a}"/><stop offset="1" stop-color="{b}"/></linearGradient></defs>'
+            f'<rect width="1200" height="630" fill="url(#g)"/>{shapes}<text x="600" y="400" font-size="220" text-anchor="middle">{e}</text></svg>')
+
+
+
+def esc(s):
+    return html.escape(s or "")
+
+
+def fdate(p):
+    try:
+        return datetime.date.fromisoformat(p["date"]).strftime("%d %b %Y")
+    except Exception:
+        return p["date"]
+
+
+def plink(p):
+    return "/" + p["category"] + "/" + p["slug"] + ".html"
+
+
+def photo(p, big=False):
+    im = p.get("image")
+    alt = esc(p["title"])
+    cover = "/covers/" + p["slug"] + ".svg"
+    if not im:
+        return '<img src="' + cover + '" alt="' + alt + '" loading="lazy">'
+    if big:      # full photo -> smaller thumbnail -> our own illustration if both fail
+        fb = " onerror=\"this.onerror=function(){this.src='" + cover + "'};this.src='" + im["thumb"] + "'\""
+        src = im["url"]
+    else:        # thumbnail -> our own illustration if it fails
+        fb = " onerror=\"this.onerror=null;this.src='" + cover + "'\""
+        src = im["thumb"]
+    return '<img src="' + src + '" alt="' + alt + '" loading="lazy"' + fb + ">"
+
+
+def kick(p):
+    return '<a class="kick" href="/' + p["category"] + '/">' + p["category"] + "</a>"
+
+
+def meta(p):
+    return '<div class="meta">By ' + esc(OWNER) + " · " + fdate(p) + " · " + str(rt(p)) + " min read</div>"
+
+
+def story_big(p):
+    u = plink(p)
+    return ('<article class="big"><a class="im" href="' + u + '">' + photo(p, True) + "</a><div>" + kick(p) +
+            '<h2><a href="' + u + '">' + esc(p["title"]) + "</a></h2><p>" + esc(p["description"]) + "</p>" + meta(p) + "</div></article>")
+
+
+def row(p):
+    u = plink(p)
+    return ('<a class="row" href="' + u + '">' + photo(p) + "<div>" + '<span class="kick">' + p["category"] + "</span><h3>" +
+            esc(p["title"]) + "</h3>" + '<div class="meta">' + fdate(p) + "</div></div></a>")
+
+
+def card(p, big=False):
+    u = plink(p)
+    return ('<article class="card"><a href="' + u + '">' + photo(p) + "</a>" + kick(p) + '<h3><a href="' + u + '">' +
+            esc(p["title"]) + "</a></h3><p>" + esc(p["description"]) + "</p>" + meta(p) + "</article>")
+
+
+def sidebar(live, skip=None):
+    items = [p for p in live if p is not skip][:5]
+    chips = "".join('<a class="chip" href="/' + c + '/">' + c.title() + "</a>" for c in CATEGORIES)
+    return ('<aside><h4 class="sh">Top headlines</h4>' + "".join(row(p) for p in items) +
+            '<h4 class="sh" style="margin-top:30px">Explore</h4><div class="chips">' + chips + "</div></aside>")
+
+
+def grid(ps):
+    if not ps:
+        return '<p class="meta">Fresh articles are on the way.</p>'
+    return '<div class="grid">' + "".join(card(p) for p in ps) + "</div>"
+
+
+def write(path, content):
+    f = SITE / path
+    f.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(content, bytes):
+        f.write_bytes(content)
+        return
+    base = urllib.parse.urlparse(URL).path.rstrip("/")
+    if base and str(path).endswith(".html"):
+        content = re.sub(r'(href|src|action)="/(?!/)', rf'\1="{base}/', content).replace("fetch('/search.json')", f"fetch('{base}/search.json')").replace("this.src='/covers/", f"this.src='{base}/covers/")
+    f.write_text(content, encoding="utf-8")
+
+
+def info_page(slug, title, desc, inner):
+    today = datetime.date.today().strftime("%B %d, %Y")
+    body = f'<article class="post"><h1>{title}</h1><p class="meta">Last updated: {today}</p>{inner}</article>'
+    write(f"{slug}.html", page(title, body, desc, f"/{slug}.html"))
+
+
+def build_pages():
+    n = html.escape(SITE_NAME)
+    info_page("about", f"About {n}", f"About {SITE_NAME}: who we are, how we research and write, and how we handle corrections.", f"""
+<p>{n} is published and edited by <strong>{html.escape(OWNER)}</strong>. It explains what people are searching for right now, in plain English. We cover technology, health, business, entertainment, sports and lifestyle, and our goal is simple: give you a clear, useful answer in a few minutes, with sources you can check.</p>
+<h2>How we make articles</h2>
+<p>Every article starts from a real trending topic. We read several public sources, write a clear explainer, and run a second review that checks claims against the sources. Articles that do not meet our quality bar are discarded, not published.</p>
+<h2>Our use of AI</h2>
+<p>We use AI tools to help research and draft articles, and we say so openly. AI assistance does not replace editorial standards: we do not invent quotes or statistics, and we list sources on articles wherever we use them.</p>
+<h2>Health and money topics</h2>
+<p>Health and finance articles are general education only. They are not medical or investment advice. Please read our <a href="/disclaimer.html">Disclaimer</a>.</p>
+<h2>Pictures</h2>
+<p>Where we use photographs, they come from openly licensed libraries such as Openverse and are credited under the picture. Otherwise we use our own illustrations.</p>
+<h2>Corrections</h2>
+<p>If you spot a mistake, <a href="/contact.html">tell us</a> and we will review it and correct it quickly.</p>""")
+    info_page("privacy", "Privacy Policy", f"How {SITE_NAME} handles your information, cookies and third-party services.", f"""
+<p>Your privacy matters. {n}, published by {html.escape(OWNER)}, explains in this policy what information it collects and how it is used.</p>
+<h2>Information we collect</h2>
+<p>You do not need an account to read {n}. If you send a message through our <a href="/contact.html">contact form</a>, we receive the name, email address and message you type, and we use them only to reply to you.</p>
+<h2>Log data</h2>
+<p>Like most websites, our hosting provider may automatically record technical data such as IP address, browser type and pages visited, for security and performance.</p>
+<h2>Cookies and local storage</h2>
+<p>Pages load fonts from Google Fonts, which may receive your IP address, and photos from openly licensed libraries. We store one preference in your browser (light or dark mode). It never leaves your device. If we add analytics or advertising in future, we will update this policy first. Where ads are shown, third-party vendors, including Google, may use cookies to serve ads based on your visits to this and other sites. You can opt out of personalised advertising in your Google Ads Settings.</p>
+<h2>External links</h2>
+<p>Our articles link to other websites. We are not responsible for their content or privacy practices.</p>
+<h2>Children</h2>
+<p>{n} is not directed to children under 13, and we do not knowingly collect their personal information.</p>
+<h2>Your choices</h2>
+<p>You can ask us to delete any message you sent us by writing through the <a href="/contact.html">contact page</a>.</p>
+<h2>Changes</h2>
+<p>We may update this policy and will change the date above when we do.</p>""")
+    info_page("terms", "Terms &amp; Conditions", f"The terms for using {SITE_NAME}.", f"""
+<p>By using {n} you agree to these terms. If you do not agree, please do not use the site.</p>
+<h2>Information only</h2>
+<p>Our content is provided for general information and education. It is not professional medical, legal, financial or investment advice. See our <a href="/disclaimer.html">Disclaimer</a>.</p>
+<h2>Accuracy</h2>
+<p>Articles are researched and drafted with AI assistance and reviewed before publishing. We work hard to be accurate, but we cannot guarantee that everything is complete, current or error-free. Please check important facts with official sources.</p>
+<h2>Intellectual property</h2>
+<p>The articles, design and branding of {n} belong to {html.escape(OWNER)}, the publisher of the site. You may share links and short excerpts with clear credit and a link back. You may not copy whole articles or republish them without permission.</p>
+<h2>Acceptable use</h2>
+<p>Do not misuse the site: no unlawful activity, no attempts to disrupt or hack it, and no automated scraping that harms performance.</p>
+<h2>Third-party links</h2>
+<p>Links to other sites are provided for convenience. We do not control or endorse their content.</p>
+<h2>No warranty and limitation of liability</h2>
+<p>The site is provided "as is" without warranties of any kind. To the fullest extent allowed by law, {n} is not liable for any loss arising from your use of the site or reliance on its content.</p>
+<h2>Changes and governing law</h2>
+<p>We may update these terms from time to time. These terms are governed by the laws of India.</p>
+<h2>Contact</h2>
+<p>Questions? Visit our <a href="/contact.html">contact page</a>.</p>""")
+    info_page("disclaimer", "Disclaimer", f"{SITE_NAME} provides general information only. Read our health, finance and accuracy disclaimer.", f"""
+<h2>Not professional advice</h2>
+<p>Everything on {n} is general information. Health articles are not medical advice and do not replace a doctor. Business and money articles are not financial or investment advice. Always consult a qualified professional about your own situation.</p>
+<h2>AI-assisted content</h2>
+<p>Articles are drafted with AI assistance and checked before publishing. Mistakes can still happen. If you notice one, please <a href="/contact.html">tell us</a>.</p>
+<h2>External sources</h2>
+<p>We link to third-party sources and are not responsible for their content.</p>""")
+    form = ('<form class="fm" name="contact" method="POST" action="/thanks.html" data-netlify="true" netlify-honeypot="bot-field">'
+            '<input type="hidden" name="form-name" value="contact"><p hidden><label>Leave empty: <input name="bot-field"></label></p>'
+            '<input name="name" placeholder="Your name" required><input type="email" name="email" placeholder="Your email" required>'
+            '<textarea name="message" rows="6" placeholder="How can we help? Corrections, questions, feedback..." required></textarea>'
+            '<button type="submit">Send message</button></form>')
+    info_page("contact", "Contact us", f"Contact {SITE_NAME} for corrections, questions or feedback.",
+              f"<p>Found an error, have a question or want to give feedback? Send us a message and we will reply as soon as we can.</p>{form}")
+    write("thanks.html", page("Thank you", '<section class="hero"><h1>Thank you!</h1><p>Your message was sent. We will get back to you soon. <a href="/">Back to home</a></p></section>', path="/thanks.html", noindex=True))
+
+
+def build():
+    live = [p for p in all_posts() if p["status"] == "published"]
+    write("style.css", CSS)
+    for p in live:
+        write("covers/" + p["slug"] + ".svg", cover_svg(p))
+    write("favicon.svg", FAVICON)
+    for name, (w, h) in {"favicon-32.png": (32, 32), "apple-touch-icon.png": (180, 180), "icon-192.png": (192, 192),
+                         "icon-512.png": (512, 512), "og-image.png": (1200, 630)}.items():
+        write(name, icon_png(w, h))
+    write("site.webmanifest", json.dumps({"name": SITE_NAME, "short_name": SITE_NAME, "start_url": "/", "display": "standalone",
+          "background_color": "#fbfaf7", "theme_color": "#b3261e",
+          "icons": [{"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"}, {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"}]}))
+    write("_headers", "/*\n  X-Content-Type-Options: nosniff\n  X-Frame-Options: SAMEORIGIN\n  Referrer-Policy: strict-origin-when-cross-origin\n")
+    # ---- home page (newspaper front page) ----
+    if live:
+        home = ('<section class="lead">' + story_big(live[0]) + '<div class="side"><h4 class="sh">Top headlines</h4>' +
+                "".join(row(p) for p in live[1:5]) + "</div></section>")
+        if live[5:11]:
+            home += '<div class="sec"><h2>Latest stories</h2></div>' + grid(live[5:11])
+    else:
+        home = '<section class="hero"><h1>Fresh articles are on the way.</h1></section>'
+    for c in CATEGORIES:
+        ps = [p for p in live if p["category"] == c][:3]
+        if ps:
+            home += '<div class="sec"><h2>' + c + '</h2><a href="/' + c + '/">More ' + c + " →</a></div>" + grid(ps)
+    site_ld = json.dumps({"@context": "https://schema.org", "@graph": [
+        {"@type": "Organization", "name": SITE_NAME, "url": URL, "logo": URL + "/icon-512.png"},
+        {"@type": "WebSite", "name": SITE_NAME, "url": URL, "potentialAction": {"@type": "SearchAction",
+         "target": URL + "/search.html?q={search_term_string}", "query-input": "required name=search_term_string"}}]})
+    write("index.html", page(SITE_NAME, home, ld='<script type="application/ld+json">' + site_ld + "</script>"))
+    for c in CATEGORIES:
+        ps = [p for p in live if p["category"] == c]
+        write(c + "/index.html", page(c.title(), '<div class="sec"><h2>' + c + '</h2></div><p class="desc">' + esc(CATEGORIES[c]) + "</p><br>" + grid(ps),
+                                      c.title() + " news and explainers: " + CATEGORIES[c], "/" + c + "/"))
+    # ---- article pages ----
+    for p in live:
+        u = plink(p)
+        im = p.get("image")
+        rel = [r for r in live if r["category"] == p["category"] and r is not p][:3]
+        rel += [r for r in live if r not in rel and r is not p][:max(0, 3 - len(rel))]
+        src = "".join('<li><a href="' + s["url"] + '" rel="noopener nofollow">' + esc(s["title"]) + "</a></li>" for s in p["sources"])
+        if im:
+            cap = ('Photo: <a href="' + im.get("link", "#") + '" rel="noopener">' + esc(im.get("credit", "Photo")) + "</a>, " +
+                   '<a href="' + im.get("license_url", "#") + '" rel="noopener">' + esc(im.get("license", "")) + "</a> via Openverse")
+            fig = "<figure>" + photo(p, True) + "<figcaption>" + cap + "</figcaption></figure>"
+        else:
+            fig = "<figure>" + photo(p, True) + "</figure>"
+        full = URL + u
+        share = ('<div class="share"><a href="https://wa.me/?text=' + full + '">WhatsApp</a><a href="https://twitter.com/intent/tweet?url=' + full + '">Post on X</a>'
+                 "<button onclick=\"navigator.clipboard.writeText(location.href);this.textContent='Copied!'\">Copy link</button></div>")
+        art = {"@context": "https://schema.org", "@type": "NewsArticle", "headline": p["title"], "description": p["description"],
+               "datePublished": p["date"], "dateModified": p["date"], "image": [im["url"] if im else URL + "/og-image.png"],
+               "author": {"@type": "Person", "name": OWNER}, "mainEntityOfPage": full,
+               "publisher": {"@type": "Organization", "name": SITE_NAME, "logo": {"@type": "ImageObject", "url": URL + "/icon-512.png"}}}
+        crumbs = {"@context": "https://schema.org", "@type": "BreadcrumbList", "itemListElement": [
+            {"@type": "ListItem", "position": 1, "name": "Home", "item": URL + "/"},
+            {"@type": "ListItem", "position": 2, "name": p["category"].title(), "item": URL + "/" + p["category"] + "/"},
+            {"@type": "ListItem", "position": 3, "name": p["title"], "item": full}]}
+        ld = "".join('<script type="application/ld+json">' + json.dumps(x) + "</script>" for x in (art, crumbs))
+        health = '<p class="note">General information only, not medical advice. Talk to a doctor about your own health.</p>' if p["category"] == "health" else ""
+        body = ('<div class="cols"><article class="art">' + kick(p) + "<h1>" + esc(p["title"]) + '</h1><p class="deck">' + esc(p["description"]) + "</p>"
+                '<div class="by"><span>By <strong>' + esc(OWNER) + "</strong> · " + fdate(p) + " · " + str(rt(p)) + " min read</span><span>" + p["category"].title() + "</span></div>"
+                + fig + '<div class="body">' + md(p["body"]) + "</div>"
+                + ('<div class="src"><h3>Sources</h3><ul>' + src + "</ul></div>" if src else "") + health + share + "</article>" + sidebar(live, p) + "</div>"
+                + '<div class="sec"><h2>More to read</h2></div>' + grid(rel))
+        write(u.lstrip("/"), page(p["title"], body, p["description"], u, "article", ld, image=(im["url"] if im else None)))
+    # ---- search, info pages, feeds ----
+    idx = [{"t": esc(p["title"]), "d": esc(p["description"]), "g": " ".join(p["tags"]), "c": p["category"], "dt": p["date"], "u": plink(p)} for p in live]
+    write("search.json", json.dumps(idx))
+    js = ("<script>fetch('/search.json').then(r=>r.json()).then(d=>{const q=document.getElementById('q'),r=document.getElementById('r');"
+          "function go(){const t=q.value.toLowerCase().trim();r.innerHTML=d.filter(p=>!t||(p.t+' '+p.d+' '+p.g).toLowerCase().includes(t))"
+          ".map(p=>`<div class=card2><a href=\"${p.u}\"><b>${p.t}</b></a><div class=meta>${p.c} · ${p.dt}</div><p>${p.d}</p></div>`).join('')||'<p>No results.</p>'}"
+          "q.value=new URLSearchParams(location.search).get('q')||'';q.oninput=go;go()})</script>")
+    write("search.html", page("Search", '<div class="sec"><h2>Search</h2></div><input id=q placeholder="Search articles…" autofocus><div id=r></div>' + js,
+                              path="/search.html", noindex=True))
+    build_pages()
+    write("404.html", page("Page not found", '<section class="hero"><h1>Page not found</h1><p><a href="/" style="text-decoration:underline">Back to the home page</a></p></section>', noindex=True))
+    write("robots.txt", "User-agent: *\nAllow: /\nSitemap: " + URL + "/sitemap.xml\n")
+    today = datetime.date.today().isoformat()
+    urls = [("/", today)] + [("/" + x + ".html", today) for x in ("about", "contact", "privacy", "terms", "disclaimer")] \
+        + [("/" + c + "/", today) for c in CATEGORIES] + [(plink(p), p["date"]) for p in live]
+    write("sitemap.xml", '<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+          + "".join("<url><loc>" + URL + u + "</loc><lastmod>" + d + "</lastmod></url>" for u, d in urls) + "</urlset>")
+    items = "".join("<item><title>" + esc(p["title"]) + "</title><link>" + URL + plink(p) + "</link><description>" + esc(p["description"]) + "</description></item>" for p in live[:20])
+    write("rss.xml", '<?xml version="1.0"?><rss version="2.0"><channel><title>' + esc(SITE_NAME) + "</title><link>" + URL +
+          "</link><description>Latest articles</description>" + items + "</channel></rss>")
+    print("built", len(live), "posts ->", SITE)
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "run": run()
+    elif cmd == "list": [print(f'{p["status"]:9} {p["category"]:14} {p["score"]}/10  {p["slug"]}') for p in all_posts()]
+    elif cmd == "approve" and len(sys.argv) > 2: approve(sys.argv[2])
+    elif cmd == "check": check()
+    elif cmd == "build": build()
+    elif cmd == "auto": run(); approve("--good"); build()   # for scheduled/Netlify builds
+    else: print(__doc__)
