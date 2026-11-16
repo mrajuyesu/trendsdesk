@@ -1,14 +1,22 @@
-name: Write new articles
+name: Write articles and publish
 on:
+  push:
+    branches: [main]
+    paths: ["posts/**", "autoblog.py", ".github/workflows/**"]
   schedule:
     - cron: "0 */8 * * *"
   workflow_dispatch:
 permissions:
   contents: write
+  pages: write
+  id-token: write
+concurrency:
+  group: pages
+  cancel-in-progress: false
 jobs:
-  write:
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     env:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       MAX_POSTS: "2"
@@ -19,20 +27,42 @@ jobs:
         with:
           python-version: "3.12"
       - name: Check the Google key
-        timeout-minutes: 6
+        if: github.event_name != 'push'
+        continue-on-error: true
+        timeout-minutes: 5
         run: |
           if [ -z "$GEMINI_API_KEY" ]; then echo "::error::Secret GEMINI_API_KEY is missing or named wrong"; exit 1; fi
           python autoblog.py check
       - name: Write articles
-        timeout-minutes: 12
+        if: github.event_name != 'push'
+        continue-on-error: true
+        timeout-minutes: 15
         run: python autoblog.py run
       - name: Publish good articles
-        if: always()
+        if: github.event_name != 'push'
         run: python autoblog.py approve --good
-      - name: Save to repository
-        if: always()
+      - name: Save new articles
+        if: github.event_name != 'push'
         run: |
           git config user.name autoblog
           git config user.email bot@users.noreply.github.com
           git add posts
           git diff --cached --quiet || (git commit -m "New articles" && git push)
+      - name: Build website
+        run: |
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"; REPO="${GITHUB_REPOSITORY#*/}"; REPO="${REPO,,}"
+          if [ "$REPO" = "$OWNER.github.io" ]; then export SITE_URL="https://$OWNER.github.io"; else export SITE_URL="https://$OWNER.github.io/$REPO"; fi
+          echo "Site address: $SITE_URL"
+          python autoblog.py build
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.d.outputs.page_url }}
+    steps:
+      - id: d
+        uses: actions/deploy-pages@v4
