@@ -21,6 +21,7 @@ GEO = os.getenv("TRENDS_GEO", "IN")                 # country code for trends
 MODEL = os.getenv("MODEL", "claude-sonnet-5-5")
 MAX_POSTS = int(os.getenv("MAX_POSTS", "3"))        # drafts per run
 MIN_SCORE = 7                                       # quality gate (1-10)
+ARTICLE_MIN_WORDS = int(os.getenv("ARTICLE_MIN_WORDS", "1200"))
 
 CATEGORIES = {
     "technology": "Gadgets, software, AI, internet and science news",
@@ -37,10 +38,11 @@ STYLE = """You are a staff writer for a trend-explainer site. Write like a sharp
 - Open with why this matters right now, not with filler.
 - Concrete facts, names, dates and numbers from the sources only. Never invent quotes or stats.
 - One clear point of view or takeaway; vary sentence length; short paragraphs.
-- Use ## subheadings, 600-900 words, end with a short 'What to watch' section.
+- Use ## subheadings, 1200-1800 words, end with a short 'What to watch' section.
 - Cite sources inline as markdown links. Do not copy source wording.
-- Health topics: general information only, from reputable bodies (WHO, CDC, NHS). No diagnoses, doses or cures; say when to see a doctor."""
-
+- Health topics: general information only, from reputable bodies (WHO, CDC, NHS). No diagnoses, doses or cures; say when to see a doctor.
+- Include detailed practical context and explanation so the article is substantial and useful, not a short summary.
+"""
 
 WORKING = {"model": None}
 
@@ -150,6 +152,51 @@ def categorize(trends):
 
 
 # ---------- 3-5. research (real sources), write, quality gate ----------
+def featured_image_url(trend, category="technology"):
+    category = category if category in CATEGORIES else "technology"
+    pools = {
+        "technology": [
+            "https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1516321318423-f06f85e504b3?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1498050108023-c5249f4df085?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1515879218367-8466d910aaa4?auto=format&fit=crop&w=1200&q=80",
+        ],
+        "health": [
+            "https://images.unsplash.com/photo-1576091160550-2173dba999ef?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1532330393533-443990a51d10?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1544367567-0f2fcb009e0b?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1517836357463-d25dfeac3438?auto=format&fit=crop&w=1200&q=80",
+        ],
+        "business": [
+            "https://images.unsplash.com/photo-1522202176988-66273c2fd55f?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1552664730-d307ca884978?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1559526324-4b87b5e36e44?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1524758631624-e2822e304c36?auto=format&fit=crop&w=1200&q=80",
+        ],
+        "entertainment": [
+            "https://images.unsplash.com/photo-1516280440614-37939bbacd81?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1499364615650-ec38552f4f34?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1513106580091-1d82408b8cd6?auto=format&fit=crop&w=1200&q=80",
+        ],
+        "sports": [
+            "https://images.unsplash.com/photo-1547347298-4074fc3086f0?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1517649763962-0c623066013b?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1574629810360-7efbbe195018?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1518604666860-9ed391f76460?auto=format&fit=crop&w=1200&q=80",
+        ],
+        "lifestyle": [
+            "https://images.unsplash.com/photo-1500530855697-b586d89ba3ee?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1493246507139-91e8fad9978e?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1507525428034-b723cf961d3e?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1527631746610-bca00a040d60?auto=format&fit=crop&w=1200&q=80",
+        ],
+    }
+    key = (trend or {}).get("title", category)
+    idx = sum(ord(ch) for ch in key) % len(pools[category])
+    return pools[category][idx]
+
+
 def write_post(trend, pick):
     srcs = trend["sources"][:4]
     pack = []
@@ -163,10 +210,13 @@ def write_post(trend, pick):
     draft = llm("Topic: " + trend["title"] + "\nCategory: " + pick["category"] + "\nAngle: " + str(pick.get("angle", "")) +
                 "\nWrite the article using ONLY the source material below. Do not add facts that the sources do not support. "
                 'If the material is too thin for a useful article, return {"skip": true}. Otherwise return JSON only: '
-                '{"title":"","description":"max 155 chars","tags":["",""],"body":"markdown"}\n\n' + material,
+                '{"title":"","description":"max 155 chars","tags":["",""],"body":"markdown","image_url":"https://..."}\n\n' + material,
                 system=STYLE, max_tokens=6000)
     post = jload(draft)
     if post.get("skip"):
+        return None
+    post.setdefault("image_url", featured_image_url(trend, pick.get("category")))
+    if len(post.get("body", "").split()) < ARTICLE_MIN_WORDS:
         return None
     post["sources"] = [{"title": s["title"] or s["url"], "url": s["url"]} for s in srcs]
     review = jload(llm("Review this draft as a strict editor against the sources. Score 1-10 for accuracy (every claim supported), "
@@ -190,7 +240,8 @@ def save(post, category, trend_title=""):
         return slug + " (already exists, kept)"
     meta = {"title": post["title"], "description": post["description"], "category": category,
             "date": date, "tags": post["tags"], "sources": post["sources"],
-            "score": post["score"], "trend": trend_title, "status": "draft"}
+            "score": post["score"], "trend": trend_title, "status": "draft",
+            "image_url": post.get("image_url") or featured_image_url({"title": trend_title or post["title"]}, category)}
     text = "".join(f"{k}: {json.dumps(v, ensure_ascii=False)}\n" for k, v in meta.items())
     (d / f"{slug}.md").write_text(f"---\n{text}---\n{post['body']}\n", encoding="utf-8")
     return slug
@@ -277,53 +328,32 @@ COLORS = {"technology": ("#2563eb", "#7c3aed", "💻"), "business": ("#059669", 
           "entertainment": ("#db2777", "#f59e0b", "🎬"), "sports": ("#ea580c", "#dc2626", "🏆"),
           "lifestyle": ("#7c3aed", "#ec4899", "✨"), "health": ("#0d9488", "#22c55e", "🩺")}
 
-CSS = """:root{--bg:#fff;--fg:#14161a;--mut:#667085;--ac:#2563eb;--line:#e5e7eb;--card:#f8fafc}
-[data-theme=dark]{--bg:#0e1116;--fg:#eceef2;--mut:#9aa3b2;--ac:#7aa7ff;--line:#262b34;--card:#151a22}
-*{box-sizing:border-box}html{scroll-behavior:smooth}
-body{display:flex;flex-direction:column;min-height:100vh;margin:0;background:var(--bg);color:var(--fg);font:17px/1.7 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
-a{color:inherit;text-decoration:none}.w{width:100%;max-width:1100px;margin:auto;padding:0 20px}main.w{flex:1;margin:0 auto}.sl{display:none}
-header{position:sticky;top:0;z-index:9;background:var(--bg);border-bottom:1px solid var(--line)}
-.bar{display:flex;align-items:center;gap:18px;height:64px}.logo{font-weight:800;font-size:22px;letter-spacing:-.5px}
-.logo b{color:var(--ac)}nav{display:flex;gap:4px;overflow-x:auto;flex:1}
-nav a{padding:6px 12px;border-radius:99px;font-size:15px;color:var(--mut);text-transform:capitalize;white-space:nowrap}
-nav a:hover{background:var(--card);color:var(--fg)}
-.sf input{border:1px solid var(--line);background:var(--card);color:var(--fg);padding:8px 14px;border-radius:99px;width:170px;font:inherit;font-size:14px}
-#tg{border:1px solid var(--line);background:var(--card);color:var(--fg);width:38px;height:38px;border-radius:50%;cursor:pointer;font-size:16px}
-.hero{padding:36px 0 8px}.hero h1{font-size:clamp(28px,5vw,46px);line-height:1.15;letter-spacing:-1px;margin:0 0 8px}
-.hero p{color:var(--mut);margin:0}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:24px;margin:24px 0}
-.card{border:1px solid var(--line);border-radius:16px;overflow:hidden;background:var(--card);transition:.2s}
-.card:hover{transform:translateY(-3px);box-shadow:0 10px 30px rgba(0,0,0,.12)}
-.card.big{display:grid;grid-template-columns:1.1fr 1fr;margin:24px 0}.card.big .th{height:100%;min-height:260px}.card.big h3{font-size:28px}
-.th{height:160px;display:flex;align-items:center;justify-content:center}.th span{font-size:54px;filter:drop-shadow(0 4px 8px rgba(0,0,0,.25))}
-.cb{padding:18px}.cb h3{margin:6px 0;font-size:20px;line-height:1.3}.cb p{margin:0 0 10px;color:var(--mut);font-size:15px}
-.tag{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--ac)}
-.meta{font-size:13px;color:var(--mut)}.sec{display:flex;justify-content:space-between;align-items:baseline;margin-top:40px}
-.sec h2{margin:0;font-size:24px;text-transform:capitalize}.sec a{color:var(--ac);font-size:14px}
-article.post{max-width:720px;margin:36px auto}article.post h1{font-size:clamp(28px,5vw,42px);line-height:1.15;letter-spacing:-1px;margin:8px 0}
-.post h2{margin-top:2em;font-size:26px}.post p,.post li{font-size:18px;line-height:1.8}.post a{color:var(--ac);text-decoration:underline}
-.crumb{font-size:14px;color:var(--mut)}.share{display:flex;gap:10px;margin:24px 0}
-.share a,.share button{border:1px solid var(--line);background:var(--card);color:var(--fg);padding:7px 14px;border-radius:99px;font:inherit;font-size:14px;cursor:pointer}
-.note{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px;font-size:14px;color:var(--mut);margin:28px 0}
-.card2{padding:16px 0;border-bottom:1px solid var(--line)}#q{width:100%;padding:12px 16px;border:1px solid var(--line);border-radius:12px;background:var(--card);color:var(--fg);font:inherit;margin:16px 0}
-footer{border-top:1px solid var(--line);margin-top:60px;padding:40px 0 24px;background:var(--card);color:var(--mut);font-size:14px}footer .fg{display:grid;grid-template-columns:2fr 1fr 1fr;gap:30px}footer p{margin:8px 0;max-width:340px}footer h4{margin:0 0 8px;color:var(--fg);font-size:13px;text-transform:uppercase;letter-spacing:.08em}footer a{display:block;margin:6px 0}footer a:hover{color:var(--ac)}footer .fb{display:flex;justify-content:space-between;border-top:1px solid var(--line);margin-top:28px;padding-top:16px}
-@media(max-width:900px){.card.big{grid-template-columns:1fr}.card.big .th{min-height:180px}.sf{display:none}.sl{display:block}footer .fg{grid-template-columns:1fr 1fr}}"""
-
-
-CSS += """
-footer{border-top:1px solid var(--line);margin-top:60px;padding:40px 0 24px;color:var(--mut);font-size:14px;background:var(--card)}
-.fg{display:grid;grid-template-columns:2fr 1fr 1fr;gap:32px}footer h4{margin:0 0 10px;color:var(--fg);font-size:15px}
-footer .fg a{display:block;padding:3px 0}footer a:hover{color:var(--ac)}footer p{margin:8px 0 0;max-width:340px}
-.fb{margin-top:28px;padding-top:18px;border-top:1px solid var(--line)}
-.fm{display:grid;gap:12px;max-width:560px}.fm input,.fm textarea{width:100%;padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--fg);font:inherit}
-.fm button{justify-self:start;background:var(--ac);color:#fff;border:0;padding:12px 24px;border-radius:99px;font:inherit;cursor:pointer}
-@media(max-width:900px){.fg{grid-template-columns:1fr 1fr}}"""
+CSS = """:root{--bg:#f4f7fb;--bg-strong:#0b1220;--fg:#101828;--mut:#5f6b7a;--card:#ffffff;--card-alt:#eef4ff;--line:rgba(15,23,42,.1);--accent:#4f46e5;--accent-2:#0ea5e9;--accent-3:#10b981;--shadow:0 18px 45px rgba(15,23,42,.12)}
+[data-theme=dark]{--bg:#0b1220;--fg:#e5eefb;--mut:#a7b3c6;--card:#111b2e;--card-alt:#0f172a;--line:rgba(148,163,184,.18);--accent:#8b5cf6;--accent-2:#38bdf8;--accent-3:#34d399;--shadow:0 22px 50px rgba(2,6,23,.55)}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:radial-gradient(circle at top, rgba(79,70,229,.12), transparent 28%), var(--bg);color:var(--fg);font:16px/1.75 Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+a{color:inherit;text-decoration:none}img{max-width:100%}.w{width:min(1180px,calc(100% - 32px));margin:0 auto}main.w{flex:1}.sl{display:none}
+header{position:sticky;top:0;z-index:30;background:rgba(244,247,251,.78);backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
+[data-theme=dark] header{background:rgba(11,18,32,.76)}
+.bar{display:flex;align-items:center;gap:18px;min-height:72px}
+.logo{font-weight:900;font-size:1.7rem;letter-spacing:-.06em}.logo b{color:var(--accent)}nav{display:flex;align-items:center;gap:8px;overflow-x:auto;flex:1;padding:8px 0}
+nav a{padding:9px 14px;border-radius:999px;font-size:.92rem;color:var(--mut);text-transform:capitalize;white-space:nowrap;transition:all .2s ease}
+nav a:hover{background:var(--card-alt);color:var(--fg)}
+.sf{margin-left:auto}.sf input{width:210px;border:1px solid var(--line);background:var(--card);color:var(--fg);padding:10px 16px;border-radius:999px;font:inherit;font-size:.9rem;box-shadow:inset 0 1px 2px rgba(0,0,0,.03)}
+#tg{border:1px solid var(--line);background:var(--card);color:var(--fg);width:42px;height:42px;border-radius:50%;cursor:pointer;font-size:1rem;box-shadow:var(--shadow)}
+.hero{padding:56px 0 8px}.hero h1{margin:0 0 14px;font-size:clamp(2.4rem,5vw,4.1rem);line-height:1.05;letter-spacing:-.065em}.hero p{margin:0;color:var(--mut);font-size:1.06rem}.eyebrow{display:inline-flex;align-items:center;gap:10px;padding:8px 12px;background:linear-gradient(135deg,var(--accent),var(--accent-2));color:#fff;border-radius:999px;font-size:.72rem;font-weight:800;letter-spacing:.08em;text-transform:uppercase;margin-bottom:16px;box-shadow:var(--shadow)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:24px;margin:32px 0}
+.card{border:1px solid var(--line);border-radius:24px;overflow:hidden;background:var(--card);box-shadow:0 10px 30px rgba(15,23,42,.06);transition:transform .2s ease, box-shadow .2s ease}.card:hover{transform:translateY(-6px);box-shadow:0 24px 48px rgba(15,23,42,.12)}
+.card.big{display:grid;grid-template-columns:1.15fr .85fr;overflow:hidden}.card.big .cv{height:100%;min-height:280px}.cb{padding:22px 20px 18px}.cb h3{margin:10px 0 8px;font-size:1.7rem;line-height:1.25;letter-spacing:-.04em}.cb p{margin:0 0 14px;color:var(--mut);font-size:.98rem}.tag{display:inline-flex;align-items:center;padding:6px 10px;border-radius:999px;background:var(--card-alt);color:var(--accent);font-size:.7rem;font-weight:800;text-transform:uppercase;letter-spacing:.12em}
+.meta{display:flex;align-items:center;gap:8px;color:var(--mut);font-size:.82rem}.meta::before{content:"•";font-weight:700}.meta:first-child::before{content:""}.sec{display:flex;justify-content:space-between;align-items:end;margin-top:46px}.sec h2{margin:0;font-size:1.8rem;letter-spacing:-.04em;text-transform:capitalize}.sec a{color:var(--accent);font-weight:700}.cv{width:100%;height:210px;object-fit:cover;display:block}.card.big .cv{height:100%;min-height:260px}.hero-img{width:100%;aspect-ratio:16/9;object-fit:cover;border-radius:24px;display:block;box-shadow:var(--shadow);margin:16px 0 20px;border:1px solid var(--line)}
+article.post{max-width:820px;margin:32px auto 36px}article.post h1{font-size:clamp(2.1rem,5vw,3.3rem);line-height:1.1;letter-spacing:-.06em;margin:8px 0 10px}.post h2{margin-top:2.1em;margin-bottom:.7em;font-size:clamp(1.5rem,2vw,2rem);line-height:1.2;letter-spacing:-.04em}.post h3{margin-top:1.8em;font-size:1.2rem}.post p,.post li{font-size:1.08rem;line-height:1.9;color:var(--fg)}.post a{color:var(--accent);text-decoration:underline;text-decoration-thickness:1.5px}.crumb{font-size:.82rem;color:var(--mut);margin-bottom:10px}.share{display:flex;flex-wrap:wrap;gap:10px;margin:28px 0}.share a,.share button{border:1px solid var(--line);background:var(--card);color:var(--fg);padding:8px 14px;border-radius:999px;font:inherit;font-size:.85rem;cursor:pointer;box-shadow:0 3px 10px rgba(15,23,42,.04)}.note{background:linear-gradient(135deg,var(--card-alt),transparent);border:1px solid var(--line);border-radius:16px;padding:16px 18px;font-size:.92rem;color:var(--mut);margin:28px 0}.card2{padding:16px 0;border-bottom:1px solid var(--line)}#q{width:100%;padding:14px 16px;border:1px solid var(--line);border-radius:16px;background:var(--card);color:var(--fg);font:inherit;margin:10px 0 18px;box-shadow:inset 0 1px 2px rgba(0,0,0,.04)}
+footer{margin-top:62px;padding:46px 0 26px;background:var(--card-alt);border-top:1px solid var(--line)}.fg{display:grid;grid-template-columns:2fr 1fr 1fr;gap:32px}.fg h4{margin:0 0 10px;font-size:.92rem;letter-spacing:.08em;text-transform:uppercase;color:var(--fg)}footer a{display:block;padding:3px 0;color:var(--mut)}footer a:hover{color:var(--accent)}footer p{margin:10px 0 0;max-width:360px;color:var(--mut)}.fb{margin-top:26px;padding-top:18px;border-top:1px solid var(--line);color:var(--mut);font-size:.82rem}.fm{display:grid;gap:12px;max-width:560px}.fm input,.fm textarea{width:100%;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--card);color:var(--fg);font:inherit}.fm button{justify-self:start;background:linear-gradient(135deg,var(--accent),var(--accent-2));color:#fff;border:0;padding:12px 24px;border-radius:999px;font:inherit;cursor:pointer;box-shadow:var(--shadow)}
+@media(max-width:900px){.card.big{grid-template-columns:1fr}.bar{gap:10px}.sf{display:none}.sl{display:block}nav{gap:2px}.fg{grid-template-columns:1fr 1fr}}"""
 
 CSS += ".cv{width:100%;height:170px;object-fit:cover;display:block}.card.big .cv{height:100%;min-height:260px}.hero-img{width:100%;border-radius:16px;margin:18px 0;display:block}"
 
 FAVICON = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
-           '<stop offset="0" stop-color="#2563eb"/><stop offset="1" stop-color="#7c3aed"/></linearGradient></defs>'
-           '<rect width="64" height="64" rx="14" fill="url(#g)"/><path d="M16 17h32v8H36v22h-8V25H16z" fill="#fff"/></svg>')
+            '<stop offset="0" stop-color="#2563eb"/><stop offset="1" stop-color="#7c3aed"/></linearGradient></defs>'
+            '<rect width="64" height="64" rx="14" fill="url(#g)"/><path d="M16 17h32v8H36v22h-8V25H16z" fill="#fff"/></svg>')
 
 
 def icon_png(w, h):
@@ -406,8 +436,9 @@ def cover_svg(p):
 
 def card(p, big=False):
     u = f'/{p["category"]}/{p["slug"]}.html'
+    image = p.get("image_url") or f'/covers/{p["slug"]}.svg'
     cls = "card big" if big else "card"
-    return (f'<article class="{cls}"><a href="{u}"><img class="cv" src="/covers/{p["slug"]}.svg" alt="{html.escape(p["title"])}" loading="lazy"></a>'
+    return (f'<article class="{cls}"><a href="{u}"><img class="cv" src="{image}" alt="{html.escape(p["title"])}" loading="lazy"></a>'
             f'<div class="cb"><a class="tag" href="/{p["category"]}/">{p["category"]}</a><h3><a href="{u}">{html.escape(p["title"])}</a></h3>'
             f'<p>{html.escape(p["description"])}</p><div class="meta">{p["date"]} · {rt(p)} min read</div></div></article>')
 
@@ -439,11 +470,11 @@ def info_page(slug, title, desc, inner):
 def build_pages():
     n = html.escape(SITE_NAME)
     info_page("about", f"About {n}", f"About {SITE_NAME}: who we are, how we research and write, and how we handle corrections.", f"""
-<p>{n} is published and edited by <strong>{html.escape(OWNER)}</strong>. It explains what people are searching for right now, in plain English. We cover technology, health, business, entertainment, sports and lifestyle, and our goal is simple: give you a clear, useful answer in a few minutes, with sources you can check.</p>
+<p>{n} is published and edited by <strong>{html.escape(OWNER)}</strong>. It explains what people are searching for right now, in plain English. We cover technology, health, business, entertainment, sports and lifestyle.</p>
 <h2>How we make articles</h2>
-<p>Every article starts from a real trending topic. We read several public sources, write a clear explainer, and run a second review that checks claims against the sources. Articles that do not meet our quality bar are discarded, not published.</p>
+<p>Every article starts from a real trending topic. We read several public sources, write a clear explainer and run a second review that checks claims against the sources. Articles that do not meet our standards are not published.</p>
 <h2>Our use of AI</h2>
-<p>We use AI tools to help research and draft articles, and we say so openly. AI assistance does not replace editorial standards: we do not invent quotes or statistics, and we list sources on articles wherever we use them.</p>
+<p>We use AI tools to help research and draft articles, and we say so openly. AI assistance does not replace editorial standards: we do not invent quotes or statistics, and we list sources on articles.</p>
 <h2>Health and money topics</h2>
 <p>Health and finance articles are general education only. They are not medical or investment advice. Please read our <a href="/disclaimer.html">Disclaimer</a>.</p>
 <h2>Corrections</h2>
@@ -451,11 +482,11 @@ def build_pages():
     info_page("privacy", "Privacy Policy", f"How {SITE_NAME} handles your information, cookies and third-party services.", f"""
 <p>Your privacy matters. {n}, published by {html.escape(OWNER)}, explains in this policy what information it collects and how it is used.</p>
 <h2>Information we collect</h2>
-<p>You do not need an account to read {n}. If you send a message through our <a href="/contact.html">contact form</a>, we receive the name, email address and message you type, and we use them only to reply to you.</p>
+<p>You do not need an account to read {n}. If you send a message through our <a href="/contact.html">contact form</a>, we receive the name, email address and message you type, and we use them only to respond.</p>
 <h2>Log data</h2>
 <p>Like most websites, our hosting provider may automatically record technical data such as IP address, browser type and pages visited, for security and performance.</p>
 <h2>Cookies and local storage</h2>
-<p>We store one preference in your browser (light or dark mode). It never leaves your device. If we add analytics or advertising in future, we will update this policy first. Where ads are shown, third-party vendors, including Google, may use cookies to serve ads based on your visits to this and other sites. You can opt out of personalised advertising in your Google Ads Settings.</p>
+<p>We store one preference in your browser (light or dark mode). It never leaves your device. If we add analytics or advertising in future, we will update this policy first.</p>
 <h2>External links</h2>
 <p>Our articles link to other websites. We are not responsible for their content or privacy practices.</p>
 <h2>Children</h2>
@@ -469,9 +500,9 @@ def build_pages():
 <h2>Information only</h2>
 <p>Our content is provided for general information and education. It is not professional medical, legal, financial or investment advice. See our <a href="/disclaimer.html">Disclaimer</a>.</p>
 <h2>Accuracy</h2>
-<p>Articles are researched and drafted with AI assistance and reviewed before publishing. We work hard to be accurate, but we cannot guarantee that everything is complete, current or error-free. Please check important facts with official sources.</p>
+<p>Articles are researched and drafted with AI assistance and reviewed before publishing. We work hard to be accurate, but we cannot guarantee that everything is complete, current or error-free.</p>
 <h2>Intellectual property</h2>
-<p>The articles, design and branding of {n} belong to {html.escape(OWNER)}, the publisher of the site. You may share links and short excerpts with clear credit and a link back. You may not copy whole articles or republish them without permission.</p>
+<p>The articles, design and branding of {n} belong to {html.escape(OWNER)}, the publisher of the site. You may share links and short excerpts with clear credit and a link back. You may not copy or republish large sections without permission.</p>
 <h2>Acceptable use</h2>
 <p>Do not misuse the site: no unlawful activity, no attempts to disrupt or hack it, and no automated scraping that harms performance.</p>
 <h2>Third-party links</h2>
@@ -484,7 +515,7 @@ def build_pages():
 <p>Questions? Visit our <a href="/contact.html">contact page</a>.</p>""")
     info_page("disclaimer", "Disclaimer", f"{SITE_NAME} provides general information only. Read our health, finance and accuracy disclaimer.", f"""
 <h2>Not professional advice</h2>
-<p>Everything on {n} is general information. Health articles are not medical advice and do not replace a doctor. Business and money articles are not financial or investment advice. Always consult a qualified professional about your own situation.</p>
+<p>Everything on {n} is general information. Health articles are not medical advice and do not replace a doctor. Business and money articles are not financial or investment advice. Always consult a qualified professional for personal decisions.</p>
 <h2>AI-assisted content</h2>
 <p>Articles are drafted with AI assistance and checked before publishing. Mistakes can still happen. If you notice one, please <a href="/contact.html">tell us</a>.</p>
 <h2>External sources</h2>
@@ -496,7 +527,7 @@ def build_pages():
             '<button type="submit">Send message</button></form>')
     info_page("contact", "Contact us", f"Contact {SITE_NAME} for corrections, questions or feedback.",
               f"<p>Found an error, have a question or want to give feedback? Send us a message and we will reply as soon as we can.</p>{form}")
-    write("thanks.html", page("Thank you", '<section class="hero"><h1>Thank you!</h1><p>Your message was sent. We will get back to you soon. <a href="/">Back to home</a></p></section>', path="/thanks.html", noindex=True))
+    write("thanks.html", page("Thank you", '<section class="hero"><h1>Thank you!</h1><p>Your message was sent. We will get back to you soon. <a href="/">Back to home</a></p></section>', path="/thanks.html"))
 
 
 def build():
@@ -513,7 +544,7 @@ def build():
           "icons": [{"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"}, {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"}]}))
     write("_headers", "/*\n  X-Content-Type-Options: nosniff\n  X-Frame-Options: SAMEORIGIN\n  Referrer-Policy: strict-origin-when-cross-origin\n/*.png\n  Cache-Control: public, max-age=604800\n")
     # home
-    hero = ('<section class="hero"><h1>What the world is searching for, explained.</h1>'
+    hero = ('<section class="hero"><div class="eyebrow">Fresh reporting</div><h1>What the world is searching for, explained.</h1>'
             '<p>Sourced, plain-English explainers on today\'s trending topics.</p></section>')
     home = hero + (card(live[0], True) if live else "") + f'<div class="sec"><h2>Latest</h2></div>{grid(live[1:7])}'
     for c in CATEGORIES:
@@ -535,7 +566,7 @@ def build():
         src = "".join(f'<li><a href="{s["url"]}" rel="noopener nofollow">{html.escape(s["title"])}</a></li>' for s in p["sources"])
         u = f'/{p["category"]}/{p["slug"]}.html'
         art = {"@context": "https://schema.org", "@type": "Article", "headline": p["title"], "description": p["description"],
-               "datePublished": p["date"], "dateModified": p["date"], "image": [f"{URL}/og-image.png"],
+               "datePublished": p["date"], "dateModified": p["date"], "image": [p.get("image_url") or f"{URL}/og-image.png"],
                "author": {"@type": "Person", "name": OWNER}, "mainEntityOfPage": URL + u,
                "publisher": {"@type": "Organization", "name": SITE_NAME, "logo": {"@type": "ImageObject", "url": f"{URL}/icon-512.png"}}}
         crumbs = {"@context": "https://schema.org", "@type": "BreadcrumbList", "itemListElement": [
@@ -549,9 +580,15 @@ def build():
         note = "This article was researched and drafted with AI assistance and reviewed before publishing. Spot an error? <a href=\"/contact.html\">Tell us</a>."
         if p["category"] == "health":
             note += " This is general information, not medical advice; talk to a doctor about your own health."
+        image_url = p.get("image_url") or f'/covers/{p["slug"]}.svg'
         body = (f'<article class="post"><div class="crumb"><a href="/">Home</a> / <a href="/{p["category"]}/">{p["category"].title()}</a></div>'
-                f'<h1>{html.escape(p["title"])}</h1><div class="meta">By {html.escape(OWNER)} · {p["date"]} · {rt(p)} min read</div><img class="hero-img" src="/covers/{p["slug"]}.svg" alt="{html.escape(p["title"])}">{share}{md(p["body"])}'
-                + (f"<h2>Sources</h2><ul>{src}</ul>" if src else "") + f'<div class="note">{note}</div></article>'
+                f'<h1>{html.escape(p["title"])}</h1><div class="meta">By {html.escape(OWNER)} · {p["date"]} · {rt(p)} min read</div>'
+                f'<img class="hero-img" src="{image_url}" alt="{html.escape(p["title"])}">'
+                f'{html.escape(p["description"])}' if False else '' )
+        body = (f'<article class="post"><div class="crumb"><a href="/">Home</a> / <a href="/{p["category"]}/">{p["category"].title()}</a></div>'
+                f'<h1>{html.escape(p["title"])}</h1><div class="meta">By {html.escape(OWNER)} · {p["date"]} · {rt(p)} min read</div>'
+                f'<img class="hero-img" src="{image_url}" alt="{html.escape(p["title"])}"><p class="meta">{html.escape(p["description"])}</p>'
+                + p["body"] + (f'<h2>Sources</h2><ul>{src}</ul>' if src else "") + f'<div class="note">{note}</div>{share}</article>'
                 + (f'<div class="sec"><h2>Related</h2></div>{grid(rel)}' if rel else ""))
         write(u.lstrip("/"), page(p["title"], body, p["description"], u, "article", ld))
     # search, pages, feeds
