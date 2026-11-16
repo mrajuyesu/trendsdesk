@@ -15,6 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent
 POSTS, SITE = ROOT / "posts", ROOT / "site"
+OWNER = os.getenv("OWNER_NAME", "Rajuyesu")   # shown as publisher/author
 SITE_NAME = os.getenv("BLOG_NAME", "Trenddesk")   # not SITE_NAME: Netlify overwrites that one
 GEO = os.getenv("TRENDS_GEO", "IN")                 # country code for trends
 MODEL = os.getenv("MODEL", "claude-sonnet-5-5")
@@ -357,7 +358,7 @@ def footer_html():
     return (f'<footer><div class="w fg"><div><div class="logo">{SITE_NAME}<b>.</b></div>'
             f'<p>Sourced, plain-English explainers on what the world is searching for. Researched with AI assistance and reviewed before publishing.</p></div>'
             f'<div><h4>Sections</h4>{secs}</div><div><h4>Company</h4>{co}</div></div>'
-            f'<div class="w fb">© {datetime.date.today().year} {SITE_NAME}. All rights reserved. '
+            f'<div class="w fb">© {datetime.date.today().year} {SITE_NAME}. All rights reserved. Published by {html.escape(OWNER)}. '
             f'Health and finance articles are general information, not professional advice.</div></footer>')
 
 
@@ -438,7 +439,7 @@ def info_page(slug, title, desc, inner):
 def build_pages():
     n = html.escape(SITE_NAME)
     info_page("about", f"About {n}", f"About {SITE_NAME}: who we are, how we research and write, and how we handle corrections.", f"""
-<p>{n} explains what people are searching for right now, in plain English. We cover technology, health, business, entertainment, sports and lifestyle, and our goal is simple: give you a clear, useful answer in a few minutes, with sources you can check.</p>
+<p>{n} is published and edited by <strong>{html.escape(OWNER)}</strong>. It explains what people are searching for right now, in plain English. We cover technology, health, business, entertainment, sports and lifestyle, and our goal is simple: give you a clear, useful answer in a few minutes, with sources you can check.</p>
 <h2>How we make articles</h2>
 <p>Every article starts from a real trending topic. We read several public sources, write a clear explainer, and run a second review that checks claims against the sources. Articles that do not meet our quality bar are discarded, not published.</p>
 <h2>Our use of AI</h2>
@@ -448,7 +449,7 @@ def build_pages():
 <h2>Corrections</h2>
 <p>If you spot a mistake, <a href="/contact.html">tell us</a> and we will review it and correct it quickly.</p>""")
     info_page("privacy", "Privacy Policy", f"How {SITE_NAME} handles your information, cookies and third-party services.", f"""
-<p>Your privacy matters. This policy explains what information {n} collects and how it is used.</p>
+<p>Your privacy matters. {n}, published by {html.escape(OWNER)}, explains in this policy what information it collects and how it is used.</p>
 <h2>Information we collect</h2>
 <p>You do not need an account to read {n}. If you send a message through our <a href="/contact.html">contact form</a>, we receive the name, email address and message you type, and we use them only to reply to you.</p>
 <h2>Log data</h2>
@@ -470,7 +471,7 @@ def build_pages():
 <h2>Accuracy</h2>
 <p>Articles are researched and drafted with AI assistance and reviewed before publishing. We work hard to be accurate, but we cannot guarantee that everything is complete, current or error-free. Please check important facts with official sources.</p>
 <h2>Intellectual property</h2>
-<p>The articles, design and branding of {n} belong to us. You may share links and short excerpts with clear credit and a link back. You may not copy whole articles or republish them without permission.</p>
+<p>The articles, design and branding of {n} belong to {html.escape(OWNER)}, the publisher of the site. You may share links and short excerpts with clear credit and a link back. You may not copy whole articles or republish them without permission.</p>
 <h2>Acceptable use</h2>
 <p>Do not misuse the site: no unlawful activity, no attempts to disrupt or hack it, and no automated scraping that harms performance.</p>
 <h2>Third-party links</h2>
@@ -535,7 +536,7 @@ def build():
         u = f'/{p["category"]}/{p["slug"]}.html'
         art = {"@context": "https://schema.org", "@type": "Article", "headline": p["title"], "description": p["description"],
                "datePublished": p["date"], "dateModified": p["date"], "image": [f"{URL}/og-image.png"],
-               "author": {"@type": "Organization", "name": SITE_NAME}, "mainEntityOfPage": URL + u,
+               "author": {"@type": "Person", "name": OWNER}, "mainEntityOfPage": URL + u,
                "publisher": {"@type": "Organization", "name": SITE_NAME, "logo": {"@type": "ImageObject", "url": f"{URL}/icon-512.png"}}}
         crumbs = {"@context": "https://schema.org", "@type": "BreadcrumbList", "itemListElement": [
             {"@type": "ListItem", "position": 1, "name": "Home", "item": URL + "/"},
@@ -549,7 +550,7 @@ def build():
         if p["category"] == "health":
             note += " This is general information, not medical advice; talk to a doctor about your own health."
         body = (f'<article class="post"><div class="crumb"><a href="/">Home</a> / <a href="/{p["category"]}/">{p["category"].title()}</a></div>'
-                f'<h1>{html.escape(p["title"])}</h1><div class="meta">{p["date"]} · {rt(p)} min read</div><img class="hero-img" src="/covers/{p["slug"]}.svg" alt="{html.escape(p["title"])}">{share}{md(p["body"])}'
+                f'<h1>{html.escape(p["title"])}</h1><div class="meta">By {html.escape(OWNER)} · {p["date"]} · {rt(p)} min read</div><img class="hero-img" src="/covers/{p["slug"]}.svg" alt="{html.escape(p["title"])}">{share}{md(p["body"])}'
                 + (f"<h2>Sources</h2><ul>{src}</ul>" if src else "") + f'<div class="note">{note}</div></article>'
                 + (f'<div class="sec"><h2>Related</h2></div>{grid(rel)}' if rel else ""))
         write(u.lstrip("/"), page(p["title"], body, p["description"], u, "article", ld))
